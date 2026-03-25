@@ -12,6 +12,7 @@ import glob
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Add project root to sys.path so config/db imports work
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -26,12 +27,18 @@ from fastapi.responses import HTMLResponse
 app = FastAPI(title="Crypto Trading Dashboard")
 
 
+_binance_client: BinanceClient | None = None
+
+
 def _binance() -> BinanceClient:
-    return BinanceClient(
-        config.BINANCE_API_KEY,
-        config.BINANCE_SECRET_KEY,
-        requests_params={"timeout": 10},
-    )
+    global _binance_client
+    if _binance_client is None:
+        _binance_client = BinanceClient(
+            config.BINANCE_API_KEY,
+            config.BINANCE_SECRET_KEY,
+            requests_params={"timeout": 10},
+        )
+    return _binance_client
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -122,8 +129,7 @@ async def get_status():
     # Stats from closed real trades
     stats = {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "today_pnl": 0.0, "total_pnl": 0.0}
     try:
-        from datetime import date as _date
-        today = _date.today().isoformat()
+        today = datetime.now(timezone.utc).date().isoformat()
         closed = (
             db.get_client().table("trade_history")
             .select("pnl_pct,outcome,closed_at,is_dry_run")
@@ -183,11 +189,226 @@ async def get_status():
     }
 
 
+@app.get("/api/analytics")
+async def get_analytics():
+    try:
+        # All closed trades
+        trades = (
+            db.get_client().table("trade_history")
+            .select("pair,side,pnl_pct,outcome,confidence,reasoning_id,is_dry_run")
+            .not_.is_("closed_at", "null")
+            .execute()
+        ).data or []
+
+        # Fetch reasoning records for market_regime (batch by IDs)
+        regime_map = {}
+        r_ids = [t["reasoning_id"] for t in trades if t.get("reasoning_id")]
+        if r_ids:
+            recs = (
+                db.get_client().table("agent_reasoning")
+                .select("id,market_regime")
+                .in_("id", r_ids)
+                .execute()
+            ).data or []
+            regime_map = {r["id"]: r.get("market_regime", "unknown") for r in recs}
+
+        def _agg(records):
+            wins   = sum(1 for r in records if r.get("outcome") == "win")
+            losses = sum(1 for r in records if r.get("outcome") == "loss")
+            total  = wins + losses
+            pnls   = [float(r["pnl_pct"]) for r in records if r.get("pnl_pct") is not None]
+            return {
+                "wins":      wins,
+                "losses":    losses,
+                "total":     total,
+                "win_rate":  round(wins / total * 100, 1) if total else None,
+                "avg_pnl":   round(sum(pnls) / len(pnls), 2) if pnls else None,
+                "total_pnl": round(sum(pnls), 2) if pnls else 0,
+            }
+
+        # By pair
+        pairs = sorted(set(t["pair"] for t in trades))
+        by_pair = {p: _agg([t for t in trades if t["pair"] == p]) for p in pairs}
+
+        # By direction (BUY = LONG, SELL = SHORT)
+        by_direction = {
+            "LONG  (BUY)":  _agg([t for t in trades if t.get("side") == "BUY"]),
+            "SHORT (SELL)": _agg([t for t in trades if t.get("side") == "SELL"]),
+        }
+
+        # By market regime (from linked reasoning)
+        by_regime = {}
+        for t in trades:
+            regime = regime_map.get(t.get("reasoning_id"), "unknown")
+            by_regime.setdefault(regime, []).append(t)
+        by_regime = {k: _agg(v) for k, v in by_regime.items()}
+
+        # By dry vs live
+        by_mode = {
+            "dry_run": _agg([t for t in trades if t.get("is_dry_run")]),
+            "live":    _agg([t for t in trades if not t.get("is_dry_run")]),
+        }
+
+        return {
+            "total_closed": len(trades),
+            "by_pair":      by_pair,
+            "by_direction": by_direction,
+            "by_regime":    by_regime,
+            "by_mode":      by_mode,
+            "overall":      _agg(trades),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/reconcile")
+async def reconcile_stale_trades():
+    """
+    Compares every open DB trade against live Binance positions.
+    Any trade where Binance shows the position closed gets marked closed in the DB
+    with correct PnL — works even when main.py is not running.
+    """
+    c = _binance()
+    closed_trades = []
+    still_open    = []
+
+    try:
+        all_open   = db.get_all_open_trades()
+        real_open  = [t for t in all_open if not t.get("is_dry_run")]
+        dry_open   = [t for t in all_open if  t.get("is_dry_run")]
+
+        # ── Dry-run trades: check price to see if TP/SL hit ────────────────
+        for trade in dry_open:
+            pair   = trade["pair"]
+            entry  = float(trade.get("entry_price") or 0)
+            tp     = float(trade.get("take_profit_price") or 0)
+            sl     = float(trade.get("stop_loss_price") or 0)
+            side   = trade.get("side", "BUY")
+            if not entry or not tp or not sl:
+                continue
+            try:
+                if config.TRADE_MODE == "futures":
+                    px = float(c.futures_symbol_ticker(symbol=pair)["price"])
+                else:
+                    px = float(c.get_symbol_ticker(symbol=pair)["price"])
+                hit_tp = (px >= tp) if side == "BUY" else (px <= tp)
+                hit_sl = (px <= sl) if side == "BUY" else (px >= sl)
+                if hit_tp or hit_sl:
+                    lev     = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+                    raw_pnl = ((px - entry) / entry * 100) if side == "BUY" else ((entry - px) / entry * 100)
+                    pnl     = round(raw_pnl * lev, 4)
+                    outcome = "win" if hit_tp else "loss"
+                    db.get_client().table("trade_history").update({
+                        "closed_at":         datetime.now(timezone.utc).isoformat(),
+                        "actual_exit_price": px,
+                        "pnl_pct":           pnl,
+                        "outcome":           outcome,
+                        "prediction_correct": hit_tp,
+                    }).eq("id", trade["id"]).execute()
+                    closed_trades.append({"pair": pair, "type": "dry", "outcome": outcome, "pnl_pct": pnl})
+            except Exception:
+                pass
+
+        if not real_open:
+            return {
+                "success": True,
+                "message": f"Reconciled {len(closed_trades)} dry-run trade(s). No real trades to check.",
+                "closed": closed_trades,
+                "still_open": still_open,
+            }
+
+        # ── Real trades: check Binance position ────────────────────────────
+        for trade in real_open:
+            pair     = trade["pair"]
+            trade_id = trade["id"]
+            entry    = float(trade.get("entry_price") or 0)
+            side     = trade.get("side", "BUY")
+            tp       = float(trade.get("take_profit_price") or 0)
+
+            try:
+                if config.TRADE_MODE == "futures":
+                    positions = c.futures_position_information(symbol=pair)
+                    live_qty  = sum(abs(float(p.get("positionAmt", 0))) for p in positions)
+
+                    if live_qty > 0:
+                        still_open.append({"pair": pair, "qty": live_qty})
+                        continue
+
+                    # Position closed on Binance — find actual exit price
+                    exit_price = None
+                    try:
+                        recent = c.futures_account_trades(symbol=pair, limit=20)
+                        for t in sorted(recent, key=lambda x: x.get("time", 0), reverse=True):
+                            if float(t.get("realizedPnl", 0)) != 0:
+                                exit_price = float(t["price"])
+                                break
+                    except Exception:
+                        pass
+                    if not exit_price:
+                        exit_price = float(c.futures_symbol_ticker(symbol=pair)["price"])
+
+                else:  # spot
+                    asset = pair.replace("USDT", "")
+                    acct  = c.get_account()
+                    bal   = next((float(b["free"]) + float(b["locked"])
+                                  for b in acct["balances"] if b["asset"] == asset), 0.0)
+                    if bal * float(c.get_symbol_ticker(symbol=pair)["price"]) >= config.MIN_ORDER_USDT:
+                        still_open.append({"pair": pair, "qty": bal})
+                        continue
+                    recent = c.get_my_trades(symbol=pair, limit=1)
+                    exit_price = float(recent[0]["price"]) if recent else float(c.get_symbol_ticker(symbol=pair)["price"])
+
+                # Compute PnL and outcome
+                if entry:
+                    raw_pnl = ((exit_price - entry) / entry * 100) if side == "BUY" else ((entry - exit_price) / entry * 100)
+                    lev     = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+                    pnl     = round(raw_pnl * lev, 4)
+                else:
+                    pnl = 0.0
+
+                if pnl > 0.05:
+                    outcome = "win"
+                elif pnl < -0.05:
+                    outcome = "loss"
+                else:
+                    outcome = "win" if (side == "BUY" and exit_price >= tp) or (side == "SELL" and exit_price <= tp) else "loss"
+
+                db.get_client().table("trade_history").update({
+                    "closed_at":          datetime.now(timezone.utc).isoformat(),
+                    "actual_exit_price":  exit_price,
+                    "pnl_pct":            pnl,
+                    "outcome":            outcome,
+                    "prediction_correct": outcome == "win",
+                }).eq("id", trade_id).execute()
+
+                closed_trades.append({
+                    "pair":    pair,
+                    "type":    "live",
+                    "outcome": outcome,
+                    "pnl_pct": pnl,
+                    "exit":    exit_price,
+                })
+
+            except Exception as e:
+                still_open.append({"pair": pair, "error": str(e)})
+
+        n = len(closed_trades)
+        return {
+            "success":    True,
+            "message":    f"Closed {n} stale trade(s)" if n else "No stale trades found — all positions match Binance",
+            "closed":     closed_trades,
+            "still_open": still_open,
+        }
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
 @app.post("/api/cancel-dry/{trade_id}")
 async def cancel_dry_trade(trade_id: str):
     try:
         db.get_client().table("trade_history").update({
-            "closed_at": "now()",
+            "closed_at": datetime.now(timezone.utc).isoformat(),
             "outcome":   "cancelled",
             "pnl_pct":   0.0,
         }).eq("id", trade_id).execute()
@@ -267,7 +488,7 @@ async def close_position(pair: str):
                     )
                     lev = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
                     pnl_pct = round(raw * lev, 4)
-                update = {"closed_at": "now()", "outcome": "manual_close"}
+                update = {"closed_at": datetime.now(timezone.utc).isoformat(), "outcome": "manual_close"}
                 if exit_price:
                     update["actual_exit_price"] = exit_price
                 if pnl_pct is not None:

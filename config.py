@@ -27,8 +27,18 @@ SUPABASE_KEY       = os.getenv("SUPABASE_KEY", "")
 # ── External APIs ─────────────────────────────────────────────────────────
 CRYPTOPANIC_KEY    = os.getenv("CRYPTOPANIC_API_KEY", "")
 
+# ── Telegram Alerts (optional) ─────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
+
 # ── Agent behaviour ───────────────────────────────────────────────────────
-TRADING_PAIRS      = [p.strip() for p in os.getenv("TRADING_PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT").split(",") if p.strip()]
+_DEFAULT_PAIRS = (
+    "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,"
+    "DOTUSDT,LINKUSDT,LTCUSDT,NEARUSDT,ATOMUSDT,INJUSDT,APTUSDT,"
+    "ARBUSDT,OPUSDT,SUIUSDT,TONUSDT,MATICUSDT,LDOUSDT"
+)
+TRADING_PAIRS      = [p.strip() for p in os.getenv("TRADING_PAIRS", _DEFAULT_PAIRS).split(",") if p.strip()]
+SCAN_PAIRS_PER_CYCLE = int(os.getenv("SCAN_PAIRS_PER_CYCLE", "5"))   # pairs to analyse per cycle
 MIN_ORDER_USDT     = float(os.getenv("MIN_ORDER_USDT", "5.5"))   # Binance min futures order
 CYCLE_INTERVAL     = int(os.getenv("CYCLE_INTERVAL_SECONDS", "300"))
 MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "65"))

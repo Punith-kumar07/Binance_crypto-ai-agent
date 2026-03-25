@@ -10,11 +10,12 @@ Full lifecycle:
 With server-side exit orders, your computer does NOT need to stay on.
 Binance executes the exit automatically when price hits TP or SL.
 """
+import math
+import time
 from binance.client import Client as BinanceClient
 from binance.exceptions import BinanceAPIException
 from loguru import logger
 from datetime import datetime, timezone
-import math
 import config
 from risk.manager import TradeOrder
 from db import client as db
@@ -125,7 +126,6 @@ class TradeExecutor:
 
         logger.info(f"[{order.pair}] Fill: {filled_qty} @ {filled_price} | SL={sl_price} | TP={tp_price}")
 
-        import time
         logger.info(f"[{order.pair}] Waiting 3s for Binance to register asset as free...")
         time.sleep(3)
 

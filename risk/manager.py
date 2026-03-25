@@ -88,18 +88,18 @@ class RiskManager:
             return None
         # SELL now means open a SHORT (futures), not close an existing LONG.
 
-        # ── Gate 5: Signal alignment check ──────────────────────────────────
+        # ── Gate 5: Signal alignment check ─────────────────────────────────
         alignment = reasoning.get("signal_alignment", "mixed")
         if alignment == "contradictory":
             logger.info(f"[{pair}] ❌ REJECT: Signals are contradictory — too risky.")
             return None
 
-        # ── Gate 5: Extreme volatility guard ────────────────────────────────
+        # ── Gate 6: Extreme volatility guard ────────────────────────────────
         if atr_pct and atr_pct > 3.0:
             logger.warning(f"[{pair}] ⚠️  High volatility: ATR={atr_pct:.2f}%. Halving position size.")
             # We don't reject, just reduce size
 
-        # ── Gate 6: Sufficient balance ──────────────────────────────────────
+        # ── Gate 7: Sufficient balance ──────────────────────────────────────
         if balance < self.MIN_ORDER_USDT:
             logger.error(f"[{pair}] ❌ REJECT: Balance ${balance:.4f} too low to trade.")
             return None

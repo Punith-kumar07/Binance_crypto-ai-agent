@@ -129,6 +129,22 @@ def get_open_trades(pair: str) -> list:
         return []
 
 
+def get_all_open_trades() -> list:
+    """
+    Returns ALL currently open trades across every pair in one single query.
+    Use this in the main cycle instead of calling get_open_trades() per pair.
+    """
+    try:
+        res = get_client().table("trade_history") \
+            .select("*") \
+            .is_("closed_at", "null") \
+            .execute()
+        return res.data or []
+    except Exception as e:
+        logger.error(f"DB get_all_open_trades failed: {e}")
+        return []
+
+
 def get_daily_pnl_pct(pair: str) -> float:
     """Sum of pnl_pct for all trades closed today. Used for daily loss limit."""
     try:

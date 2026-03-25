@@ -15,6 +15,7 @@ from binance.client import Client as BinanceClient
 from loguru import logger
 import config
 from db import client as db
+from notifications import telegram as tg
 
 
 class FeedbackLoop:
@@ -55,7 +56,9 @@ class FeedbackLoop:
             entry = float(trade.get("entry_price", 0))
             tp = float(trade.get("take_profit_price", 0))
             sl = float(trade.get("stop_loss_price", 0))
-            pnl = (current_price - entry) / entry * 100 if trade.get("side") == "BUY" else (entry - current_price) / entry * 100
+            lev = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+            raw_pnl = (current_price - entry) / entry * 100 if trade.get("side") == "BUY" else (entry - current_price) / entry * 100
+            pnl = raw_pnl * lev
             
             logger.info(f"[{pair}] Dry-run monitoring: Price=${current_price:,.2f} | PnL={pnl:+.2f}% (TP=${tp:,.2f} / SL=${sl:,.2f})")
             
@@ -142,6 +145,16 @@ class FeedbackLoop:
             f"| PnL={pnl_pct:+.2f}% | {'WIN' if hit_tp else 'LOSS'}"
         )
 
+        tg.notify_trade_close(
+            pair=pair,
+            side=side,
+            entry=entry,
+            exit_price=current_price,
+            pnl_pct=pnl_pct,
+            outcome="win" if hit_tp else "loss",
+            is_dry=trade.get("is_dry_run", False),
+        )
+
         # Update the AI reasoning record so the agent learns from this outcome
         reasoning_id = trade.get("reasoning_id")
         if reasoning_id:
@@ -177,7 +190,10 @@ class FeedbackLoop:
         elif pnl_pct < -0.05:
             outcome = "loss"
         else:
-            outcome = "win" if (side == "BUY" and exit_price >= tp) else "loss"
+            if side == "BUY":
+                outcome = "win" if exit_price >= tp else "loss"
+            else:  # SHORT
+                outcome = "win" if exit_price <= tp else "loss"
 
         db.update_trade_outcome(trade_id, {
             "exit_price":         exit_price,
@@ -190,6 +206,16 @@ class FeedbackLoop:
         logger.info(
             f"[{pair}] {label} | Entry={entry} → Exit={exit_price} "
             f"| PnL={pnl_pct:+.2f}% | {outcome.upper()}"
+        )
+
+        tg.notify_trade_close(
+            pair=pair,
+            side=side,
+            entry=entry,
+            exit_price=exit_price,
+            pnl_pct=pnl_pct,
+            outcome=outcome,
+            is_dry=trade.get("is_dry_run", False),
         )
 
         reasoning_id = trade.get("reasoning_id")
