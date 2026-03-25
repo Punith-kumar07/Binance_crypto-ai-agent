@@ -36,6 +36,9 @@
   <!-- ── Main ───────────────────────────────────────────── -->
   <main class="max-w-screen-2xl mx-auto px-4 py-5 space-y-5">
 
+    <!-- Stats Bar -->
+    <div id="stats-bar" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3"></div>
+
     <!-- Open Positions -->
     <section>
       <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-3">📊 Open Positions</h2>
@@ -108,6 +111,7 @@
       const d = await r.json();
       lastCfg = d.cfg || {};
       renderHeader(d);
+      renderStats(d);
       renderPositions(d.positions || [], d.open_trades || [], d.prices || {});
       renderTrades(d.recent_trades || []);
       renderConfig(d.cfg || {});
@@ -134,6 +138,36 @@
     document.getElementById('hdr-bal').textContent =
       '$' + (d.balance || 0).toFixed(4) + ' USDT';
     document.getElementById('hdr-time').classList.remove('hidden');
+  }
+
+  // ════════════════════════════════════════════════════════
+  //  STATS BAR
+  // ════════════════════════════════════════════════════════
+  function renderStats(d) {
+    const s   = d.stats  || {};
+    const bal = d.balance || 0;
+    const mu  = d.margin_used || 0;
+    const unr = d.total_unrealized || 0;
+    const unrUp  = unr >= 0;
+    const todUp  = (s.today_pnl || 0) >= 0;
+    const totUp  = (s.total_pnl || 0) >= 0;
+
+    function statCard(label, value, subValue, color) {
+      return `<div class="card rounded-xl px-4 py-3">
+        <div class="text-gray-500 text-xs mb-1">${label}</div>
+        <div class="font-bold text-sm" style="color:${color}">${value}</div>
+        ${subValue ? `<div class="text-gray-600 text-xs mt-0.5">${subValue}</div>` : ''}
+      </div>`;
+    }
+
+    document.getElementById('stats-bar').innerHTML = [
+      statCard('Free Balance',    '$' + bal.toFixed(4) + ' USDT',   null, '#e5e7eb'),
+      statCard('Margin In Use',   '$' + mu.toFixed(4)  + ' USDT',   null, '#93c5fd'),
+      statCard('Unrealized PnL',  (unrUp?'+':'') + '$' + unr.toFixed(4), null, unrUp ? '#22c55e' : '#ef4444'),
+      statCard("Today's PnL",     (todUp?'+':'') + (s.today_pnl||0).toFixed(2) + '%', null, todUp ? '#22c55e' : '#ef4444'),
+      statCard('Total PnL',       (totUp?'+':'') + (s.total_pnl||0).toFixed(2) + '%', null, totUp ? '#22c55e' : '#ef4444'),
+      statCard('Win Rate',        (s.win_rate||0).toFixed(1) + '%', `${s.wins||0}W / ${s.losses||0}L of ${s.total_trades||0}`, (s.win_rate||0) >= 50 ? '#22c55e' : '#f59e0b'),
+    ].join('');
   }
 
   // ════════════════════════════════════════════════════════
@@ -210,9 +244,12 @@
         const up     = pnlPct >= 0;
         const col    = pnlPct === null ? '#9ca3af' : up ? '#22c55e' : '#ef4444';
         const bord   = pnlPct === null ? 'border-yellow-900' : up ? 'border-green-900' : 'border-red-900';
+        const usdtAmt = parseFloat(t.usdt_value || 0);
+        const pnlUsdt = (pnlPct !== null && usdtAmt) ? (pnlPct / 100) * usdtAmt : null;
         const pnlHtml = pnlPct !== null
-          ? `<div class="font-bold text-lg" style="color:${col}">${up?'+':''}${pnlPct.toFixed(2)}%</div>`
-          : `<div class="text-yellow-400 text-xs">DRY RUN</div>`;
+          ? `<div class="font-bold text-lg" style="color:${col}">${up?'+':''}${pnlPct.toFixed(2)}%</div>
+             <div class="text-xs mt-0.5" style="color:${col}">${pnlUsdt !== null ? (pnlUsdt >= 0?'+':'-') + '$' + Math.abs(pnlUsdt).toFixed(4) : ''}</div>`
+          : `<div class="text-yellow-400 text-xs font-bold">DRY RUN</div>`;
         return `
         <div class="card rounded-xl p-5 border ${bord}">
           <div class="flex items-start justify-between mb-3">
@@ -310,29 +347,25 @@
     const sl  = (c.stop_loss_pct   || 2);
     const tp  = (c.take_profit_pct || 4);
     const lev = (c.leverage || 1);
-    document.getElementById('cfg-panel').innerHTML = `
-      <div class="flex justify-between">
-        <span class="text-gray-500">Mode</span>
-        <span class="text-blue-400 font-medium">${(c.trade_mode||'spot').toUpperCase()} ${lev}x</span>
-      </div>
-      <div class="flex justify-between">
-        <span class="text-gray-500">Pairs</span>
-        <span class="text-gray-300 text-xs text-right">${(c.pairs||[]).join(', ')}</span>
-      </div>
-      <hr style="border-color:#1e1e2e"/>
-      <div class="flex justify-between">
-        <span class="text-gray-500">Stop Loss</span>
-        <span class="text-red-400">-${sl}% → -${sl*lev}% real</span>
-      </div>
-      <div class="flex justify-between">
-        <span class="text-gray-500">Take Profit</span>
-        <span class="text-green-400">+${tp}% → +${tp*lev}% real</span>
-      </div>
-      <hr style="border-color:#1e1e2e"/>
-      <div class="flex justify-between">
-        <span class="text-gray-500">R:R ratio</span>
-        <span class="text-gray-300">${(tp/sl).toFixed(1)} : 1</span>
+    function row(label, val, color) {
+      return `<div class="flex justify-between items-center">
+        <span class="text-gray-500">${label}</span>
+        <span style="color:${color||'#d1d5db'}" class="font-medium text-right">${val}</span>
       </div>`;
+    }
+    document.getElementById('cfg-panel').innerHTML = [
+      row('Mode',          `${(c.trade_mode||'spot').toUpperCase()} ${lev}x`, '#93c5fd'),
+      row('Pairs',         (c.pairs||[]).join(', '), '#d1d5db'),
+      '<hr style="border-color:#1e1e2e"/>',
+      row('Stop Loss',     `-${sl}% → -${(sl*lev).toFixed(0)}% real`, '#f87171'),
+      row('Take Profit',   `+${tp}% → +${(tp*lev).toFixed(0)}% real`, '#4ade80'),
+      row('R:R ratio',     `${(tp/sl).toFixed(1)} : 1`, '#d1d5db'),
+      '<hr style="border-color:#1e1e2e"/>',
+      row('Min Confidence',`${c.min_confidence||65}%`, '#fbbf24'),
+      row('Max Position',  `${c.max_position_pct||20}% per trade`, '#d1d5db'),
+      row('Cycle',         `every ${c.cycle_interval||60}s`, '#d1d5db'),
+      row('Daily Loss Limit', `${c.max_daily_loss_pct||-6}%`, '#f87171'),
+    ].join('');
   }
 
   // ════════════════════════════════════════════════════════

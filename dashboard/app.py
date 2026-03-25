@@ -113,19 +113,66 @@ async def get_status():
     except Exception:
         pass
 
+    # Stats from closed real trades
+    stats = {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "today_pnl": 0.0, "total_pnl": 0.0}
+    try:
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        closed = (
+            db.get_client().table("trade_history")
+            .select("pnl_pct,outcome,closed_at,is_dry_run")
+            .not_.is_("closed_at", "null")
+            .eq("is_dry_run", False)
+            .execute()
+        ).data or []
+        wins   = sum(1 for t in closed if t.get("outcome") == "win")
+        losses = sum(1 for t in closed if t.get("outcome") == "loss")
+        total  = len(closed)
+        today_pnl = sum(float(t.get("pnl_pct") or 0) for t in closed if (t.get("closed_at") or "").startswith(today))
+        total_pnl = sum(float(t.get("pnl_pct") or 0) for t in closed)
+        stats = {
+            "total_trades": total,
+            "wins":         wins,
+            "losses":       losses,
+            "win_rate":     round(wins / total * 100, 1) if total else 0.0,
+            "today_pnl":    round(today_pnl, 2),
+            "total_pnl":    round(total_pnl, 2),
+        }
+    except Exception:
+        pass
+
+    # Margin in use + total unrealized PnL across open positions
+    margin_used      = 0.0
+    total_unrealized = 0.0
+    for pos in positions:
+        total_unrealized += pos.get("unrealized_pnl", 0)
+        if config.TRADE_MODE == "futures":
+            entry = pos.get("entry", 0)
+            qty   = abs(pos.get("qty", 0))
+            lev   = config.FUTURES_LEVERAGE or 1
+            if entry and qty:
+                margin_used += qty * entry / lev
+
     return {
-        "balance":       round(balance, 4),
-        "positions":     positions,
-        "open_trades":   open_trades,
-        "recent_trades": recent_trades,
-        "prices":        prices,
+        "balance":          round(balance, 4),
+        "margin_used":      round(margin_used, 4),
+        "total_unrealized": round(total_unrealized, 4),
+        "positions":        positions,
+        "open_trades":      open_trades,
+        "recent_trades":    recent_trades,
+        "prices":           prices,
+        "stats":            stats,
         "cfg": {
-            "trade_mode":      config.TRADE_MODE,
-            "leverage":        config.FUTURES_LEVERAGE,
-            "dry_run":         config.DRY_RUN,
-            "pairs":           config.TRADING_PAIRS,
-            "stop_loss_pct":   config.STOP_LOSS_PCT * 100,
-            "take_profit_pct": config.TAKE_PROFIT_PCT * 100,
+            "trade_mode":         config.TRADE_MODE,
+            "leverage":           config.FUTURES_LEVERAGE,
+            "dry_run":            config.DRY_RUN,
+            "pairs":              config.TRADING_PAIRS,
+            "stop_loss_pct":      config.STOP_LOSS_PCT * 100,
+            "take_profit_pct":    config.TAKE_PROFIT_PCT * 100,
+            "min_confidence":     config.MIN_CONFIDENCE,
+            "cycle_interval":     config.CYCLE_INTERVAL,
+            "max_position_pct":   round(config.MAX_POSITION_PCT * 100),
+            "max_daily_loss_pct": config.MAX_DAILY_LOSS_PCT,
         },
     }
 

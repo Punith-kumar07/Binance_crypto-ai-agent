@@ -28,7 +28,8 @@ SUPABASE_KEY       = os.getenv("SUPABASE_KEY", "")
 CRYPTOPANIC_KEY    = os.getenv("CRYPTOPANIC_API_KEY", "")
 
 # ── Agent behaviour ───────────────────────────────────────────────────────
-TRADING_PAIRS      = [p.strip() for p in os.getenv("TRADING_PAIRS", "BTCUSDT,ETHUSDT").split(",") if p.strip()]
+TRADING_PAIRS      = [p.strip() for p in os.getenv("TRADING_PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT").split(",") if p.strip()]
+MIN_ORDER_USDT     = float(os.getenv("MIN_ORDER_USDT", "5.5"))   # Binance min futures order
 CYCLE_INTERVAL     = int(os.getenv("CYCLE_INTERVAL_SECONDS", "300"))
 MIN_CONFIDENCE     = float(os.getenv("MIN_CONFIDENCE", "65"))
 MAX_POSITION_PCT   = float(os.getenv("MAX_POSITION_PCT", "20")) / 100
@@ -103,7 +104,7 @@ def validate():
 if __name__ == "__main__":
     validate()
     print("✅ Config OK")
-    print(f"  Pairs:       {TRADING_PAIRS}")
+    print(f"  Scan pairs:  {TRADING_PAIRS} ({len(TRADING_PAIRS)} pairs)")
     print(f"  Dry run:     {DRY_RUN}")
     print(f"  Interval:    {CYCLE_INTERVAL}s")
     print(f"  Max pos:     {MAX_POSITION_PCT*100:.0f}%")

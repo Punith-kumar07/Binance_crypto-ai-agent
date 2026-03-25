@@ -146,23 +146,70 @@ class FeedbackLoop:
         else:
             logger.debug(f"[{pair}] Trade {trade_id} has no reasoning_id — feedback accuracy not linked.")
 
+    def _close_confirmed_trade(self, trade: dict, exit_price: float):
+        """
+        Close a trade that Binance has already confirmed closed (positionAmt == 0).
+        Determines win/loss from PnL sign — does NOT re-check TP/SL price levels,
+        which can produce false negatives if exit price differs slightly from TP due to slippage.
+        """
+        trade_id = trade.get("id")
+        pair     = trade.get("pair")
+        side     = trade.get("side", "BUY")
+        entry    = float(trade.get("entry_price", 0))
+        tp       = float(trade.get("take_profit_price", 0))
+
+        if entry:
+            raw_pnl = (
+                (exit_price - entry) / entry * 100 if side == "BUY"
+                else (entry - exit_price) / entry * 100
+            )
+            lev     = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+            pnl_pct = raw_pnl * lev
+        else:
+            pnl_pct = 0.0
+
+        # Determine outcome from PnL sign; use TP/SL levels only as tiebreaker near zero
+        if pnl_pct > 0.05:
+            outcome = "win"
+        elif pnl_pct < -0.05:
+            outcome = "loss"
+        else:
+            outcome = "win" if (side == "BUY" and exit_price >= tp) else "loss"
+
+        db.update_trade_outcome(trade_id, {
+            "exit_price":         exit_price,
+            "pnl_pct":            round(pnl_pct, 4),
+            "result":             outcome,
+            "prediction_correct": outcome == "win",
+        })
+
+        label = "✅ TAKE PROFIT HIT" if outcome == "win" else "🔴 STOP LOSS HIT"
+        logger.info(
+            f"[{pair}] {label} | Entry={entry} → Exit={exit_price} "
+            f"| PnL={pnl_pct:+.2f}% | {outcome.upper()}"
+        )
+
+        reasoning_id = trade.get("reasoning_id")
+        if reasoning_id:
+            db.update_reasoning_accuracy(reasoning_id, outcome == "win")
+
     def _check_futures_trade(self, trade: dict):
-        """Check futures position status every cycle; mark closed if TP/SL was hit."""
+        """Check futures position status every cycle; mark closed if Binance shows pos_amt == 0."""
         pair = trade.get("pair")
         try:
             positions = self.binance.futures_position_information(symbol=pair)
             for pos in positions:
-                pos_amt = float(pos.get("positionAmt", 0))
+                pos_amt    = float(pos.get("positionAmt", 0))
                 mark_price = float(pos.get("markPrice", 0))
-                entry = float(trade.get("entry_price", 0))
+                entry      = float(trade.get("entry_price", 0))
 
                 if pos_amt == 0:
-                    # Position closed — find actual exit price from recent trades
+                    # Position confirmed closed on Binance — find fill price
                     exit_price = None
                     try:
-                        recent = self.binance.futures_account_trades(symbol=pair, limit=10)
+                        recent = self.binance.futures_account_trades(symbol=pair, limit=20)
                         for t in sorted(recent, key=lambda x: x.get("time", 0), reverse=True):
-                            if t.get("side") == "SELL" and float(t.get("realizedPnl", 0)) != 0:
+                            if float(t.get("realizedPnl", 0)) != 0:
                                 exit_price = float(t["price"])
                                 break
                     except Exception:
@@ -170,12 +217,13 @@ class FeedbackLoop:
                     if not exit_price:
                         ticker = self.binance.futures_symbol_ticker(symbol=pair)
                         exit_price = float(ticker["price"])
-                    self._evaluate_trade(trade, exit_price)
+
+                    self._close_confirmed_trade(trade, exit_price)
                 else:
                     pnl_pct = (mark_price - entry) / entry * 100 if entry else 0
                     unrl = float(pos.get("unRealizedProfit", 0))
-                    tp = float(trade.get("take_profit_price", 0))
-                    sl = float(trade.get("stop_loss_price", 0))
+                    tp   = float(trade.get("take_profit_price", 0))
+                    sl   = float(trade.get("stop_loss_price", 0))
                     logger.info(
                         f"[{pair}] Futures open | Mark=${mark_price:,.2f} | PnL={pnl_pct:+.2f}% "
                         f"(unrealized ${unrl:+.4f}) | TP=${tp:,.2f} | SL=${sl:,.2f}"
@@ -183,3 +231,48 @@ class FeedbackLoop:
         except Exception as e:
             logger.error(f"[{pair}] Futures feedback check failed: {e}")
             self._check_dry_run_trade(trade)
+
+    def reconcile_stale_trades(self):
+        """
+        On agent startup: compare all open DB trades against live Binance positions.
+        Any trade where Binance pos_amt == 0 is stale — close it immediately.
+        Prevents orphaned 'open' DB records when the agent was stopped while positions were live.
+        """
+        logger.info("🔁 [Reconcile] Checking for stale open trades vs Binance positions...")
+        stale_found = 0
+        for pair in config.TRADING_PAIRS:
+            open_trades = db.get_open_trades(pair)
+            if not open_trades:
+                continue
+            real_trades = [t for t in open_trades if not t.get("is_dry_run")]
+            if not real_trades:
+                continue
+            try:
+                positions = self.binance.futures_position_information(symbol=pair)
+                live_qty  = sum(abs(float(p.get("positionAmt", 0))) for p in positions)
+                if live_qty == 0:
+                    for trade in real_trades:
+                        logger.warning(
+                            f"[{pair}] Stale open trade {trade['id']} — no Binance position. Closing now."
+                        )
+                        # Get best exit price
+                        exit_price = None
+                        try:
+                            recent = self.binance.futures_account_trades(symbol=pair, limit=20)
+                            for t in sorted(recent, key=lambda x: x.get("time", 0), reverse=True):
+                                if float(t.get("realizedPnl", 0)) != 0:
+                                    exit_price = float(t["price"])
+                                    break
+                        except Exception:
+                            pass
+                        if not exit_price:
+                            ticker = self.binance.futures_symbol_ticker(symbol=pair)
+                            exit_price = float(ticker["price"])
+                        self._close_confirmed_trade(trade, exit_price)
+                        stale_found += 1
+            except Exception as e:
+                logger.error(f"[{pair}] Reconcile check failed: {e}")
+        if stale_found:
+            logger.info(f"🔁 [Reconcile] Closed {stale_found} stale trade(s).")
+        else:
+            logger.info("🔁 [Reconcile] No stale trades found.")

@@ -48,95 +48,166 @@ feedback  = FeedbackLoop()
 
 def run_cycle(pairs: list = None):
     """
-    One full research + decision cycle for all configured pairs.
-    This runs every CYCLE_INTERVAL seconds.
+    One full scan-rank-select-execute cycle.
+
+    Flow:
+      1. Feedback loop (check existing TP/SL hits)
+      2. Balance → compute available order slots
+      3. Scan all candidate pairs with AI
+      4. Rank by confidence, filter by MIN_CONFIDENCE
+      5. Execute top N (N = remaining slots)
     """
     pairs = pairs or config.TRADING_PAIRS
     cycle_start = datetime.now(timezone.utc)
 
     logger.info("=" * 60)
     logger.info(f"🔄 CYCLE START @ {cycle_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    logger.info(f"   Pairs: {pairs} | DRY_RUN: {config.DRY_RUN}")
+    logger.info(f"   Scan pool: {pairs} | DRY_RUN: {config.DRY_RUN}")
     logger.info("=" * 60)
 
-    # Step 10 first: check if any existing positions hit TP/SL
+    # ── Step 10: feedback loop ─────────────────────────────────────────────
     logger.info("🔁 [Feedback] Checking open positions...")
     try:
         feedback.check_and_update_open_trades()
     except Exception as e:
         logger.error(f"Feedback loop error: {e}")
 
-    # Main research cycle per pair
-    for pair in pairs:
-        try:
-            run_pair_cycle(pair)
-        except Exception as e:
-            logger.error(f"[{pair}] Cycle failed: {e}", exc_info=True)
-
-    elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
-    logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
-
-
-def run_pair_cycle(pair: str):
-    """Full research + trade cycle for one pair."""
-
-    # ── Pre-check 1: Skip AI if we already have an open position ───────────
-    open_trades = db.get_open_trades(pair)
-    if open_trades:
-        logger.info(f"\n[{pair}] ⏭ Skipping AI — {len(open_trades)} open position(s). Waiting for TP/SL exit.")
-        return
-
-    # ── Pre-check 2: Skip AI if balance is too low for the minimum order ──────
-    # Note: the risk manager clamps order size up to MIN_ORDER_USDT ($5.50) when
-    # balance * MAX_POSITION_PCT < $5.50 but balance >= $5.50. This allows a
-    # second order of $5.50 to be placed from the ~$6.50 remaining after the first.
+    # ── Balance + slot calculation ─────────────────────────────────────────
     balance = collector.get_usdt_balance()
-    if balance < 5.5:  # BINANCE_MIN_ORDER_USDT is 5.5
-        logger.info(f"\n[{pair}] ⏭ Skipping AI — Balance ${balance:.2f} below $5.50 minimum order size.")
-        return
+    max_slots = int(balance / config.MIN_ORDER_USDT)
 
-    # ── Step 1-2: Scan environment + gather signals ────────────────────────
-    logger.info(f"\n[{pair}] ── Step 1-2: Scanning market...")
-    snapshot = collector.collect_all(pair)
-
-    if not snapshot.get("current_price"):
-        logger.error(f"[{pair}] No price data — skipping cycle.")
-        return
-
-    # Save raw signals to Supabase
-    db.log_signal_snapshot(pair, snapshot.get("indicators_1h", {}), {
-        "price": snapshot["current_price"],
-        "fear_greed": snapshot.get("fear_greed"),
-        "news_count": len(snapshot.get("news", [])),
-        "ob_imbalance": snapshot.get("order_book_imbalance"),
-    })
-
-    # ── Step 3-6: AI Research Brain ───────────────────────────────────────
-    logger.info(f"[{pair}] ── Step 3-6: Running AI research analysis...")
-    reasoning = brain.analyze(snapshot)
-
-    direction  = reasoning.get("direction", "HOLD")
-    confidence = float(reasoning.get("confidence", 0))
-
-    logger.info(f"[{pair}] ── Step 3-6 Result: {direction} @ {confidence:.0f}% | {reasoning.get('signal_alignment')} signals")
-    logger.info(f"[{pair}] 💡 Hypothesis: {reasoning.get('hypothesis', 'N/A')}")
-
-    # ── Step 7-8: Risk check + Decision gate ──────────────────────────────
-    logger.info(f"[{pair}] ── Step 7-8: Risk evaluation...")
-    order = risk.evaluate(direction, confidence, snapshot, reasoning)
-
-    if order is None:
-        logger.info(f"[{pair}] 🚫 No trade this cycle.")
-        return
-
-    # ── Step 9: Execute ────────────────────────────────────────────────────
-    logger.info(f"[{pair}] ── Step 9: Executing trade...")
-    trade_result = executor.execute(order)
+    open_count = sum(len(db.get_open_trades(p)) for p in pairs)
+    remaining_slots = max(0, max_slots - open_count)
 
     logger.info(
-        f"[{pair}] 🎯 Trade logged: {order.side} ${order.usdt_amount:.4f} USDT "
-        f"| OrderID={trade_result.get('binance_order_id')}"
+        f"💰 Balance: ${balance:.4f} | Slots: {max_slots} total / "
+        f"{open_count} open / {remaining_slots} available"
     )
+
+    if balance < config.MIN_ORDER_USDT:
+        logger.info(f"⏭ Balance ${balance:.2f} below ${config.MIN_ORDER_USDT:.2f} minimum. Skipping scan.")
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
+        return
+
+    if remaining_slots <= 0:
+        logger.info(f"⏭ All {max_slots} slot(s) occupied. Waiting for TP/SL exits.")
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
+        return
+
+    # ── Candidate pairs: skip any with an existing open position ──────────
+    candidates = [p for p in pairs if not db.get_open_trades(p)]
+    if not candidates:
+        logger.info("⏭ No candidate pairs — all have open positions.")
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
+        return
+
+    logger.info(f"🔍 Scanning {len(candidates)} pair(s): {candidates}")
+
+    # ── Steps 1-6: Collect + AI analyse all candidates ─────────────────────
+    results = []
+    for pair in candidates:
+        try:
+            logger.info(f"\n[{pair}] ── Step 1-2: Scanning market...")
+            snapshot = collector.collect_all(pair)
+
+            if not snapshot.get("current_price"):
+                logger.error(f"[{pair}] No price data — skipping.")
+                continue
+
+            db.log_signal_snapshot(pair, snapshot.get("indicators_1h", {}), {
+                "price":        snapshot["current_price"],
+                "fear_greed":   snapshot.get("fear_greed"),
+                "news_count":   len(snapshot.get("news", [])),
+                "ob_imbalance": snapshot.get("order_book_imbalance"),
+            })
+
+            logger.info(f"[{pair}] ── Step 3-6: Running AI analysis...")
+            reasoning  = brain.analyze(snapshot)
+            direction  = reasoning.get("direction", "HOLD")
+            confidence = float(reasoning.get("confidence", 0))
+            horizon    = reasoning.get("trade_horizon_minutes", "?")
+
+            results.append({
+                "pair":      pair,
+                "snapshot":  snapshot,
+                "reasoning": reasoning,
+                "direction": direction,
+                "confidence": confidence,
+                "horizon":   horizon,
+            })
+        except Exception as e:
+            logger.error(f"[{pair}] Scan failed: {e}", exc_info=True)
+
+    if not results:
+        logger.info("🚫 No AI results. Skipping execution.")
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
+        return
+
+    # ── Rank: filter actionable, sort by confidence DESC ──────────────────
+    actionable = [
+        r for r in results
+        if r["direction"] in ("BUY", "SELL") and r["confidence"] >= config.MIN_CONFIDENCE
+    ]
+    actionable.sort(key=lambda x: x["confidence"], reverse=True)
+    selected = actionable[:remaining_slots]
+
+    # ── Print ranking table ────────────────────────────────────────────────
+    logger.info(f"\n{'─'*60}")
+    logger.info(
+        f"📊 PAIR RANKING  ({len(results)} scanned | "
+        f"{len(actionable)} actionable | {len(selected)} selected)"
+    )
+    logger.info(f"{'─'*60}")
+    for r in results:
+        if r in selected:
+            tag = "✅ SELECTED"
+        elif r["direction"] == "HOLD":
+            tag = "⏩ HOLD"
+        elif r["confidence"] < config.MIN_CONFIDENCE:
+            tag = f"⏩ LOW CONF (<{config.MIN_CONFIDENCE:.0f}%)"
+        else:
+            tag = "⏩ SLOTS FULL"
+        logger.info(
+            f"  {r['pair']:12} {r['direction']:4}  {r['confidence']:3.0f}%"
+            f"  ~{r['horizon']}min  {tag}"
+        )
+    logger.info(f"{'─'*60}\n")
+
+    if not selected:
+        logger.info("🚫 No pairs met confidence threshold. No trades this cycle.")
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
+        return
+
+    # ── Steps 7-9: Risk check + Execute for each selected pair ────────────
+    for r in selected:
+        pair      = r["pair"]
+        snapshot  = r["snapshot"]
+        reasoning = r["reasoning"]
+        direction = r["direction"]
+        confidence = r["confidence"]
+
+        try:
+            logger.info(f"\n[{pair}] ── Step 7-8: Risk evaluation...")
+            order = risk.evaluate(direction, confidence, snapshot, reasoning)
+
+            if order is None:
+                logger.info(f"[{pair}] 🚫 Risk gate rejected.")
+                continue
+
+            logger.info(f"[{pair}] ── Step 9: Executing trade...")
+            trade_result = executor.execute(order)
+
+            logger.info(
+                f"[{pair}] 🎯 Trade logged: {order.side} ${order.usdt_amount:.4f} USDT "
+                f"| OrderID={trade_result.get('binance_order_id')}"
+            )
+        except Exception as e:
+            logger.error(f"[{pair}] Execution failed: {e}", exc_info=True)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
@@ -170,6 +241,13 @@ def main():
 
     if config.DRY_RUN:
         logger.warning("🧪 DRY RUN MODE — no real orders will be placed")
+
+    # Reconcile any stale open DB trades against live Binance positions
+    # (handles case where agent was stopped while positions were open and Binance closed them)
+    try:
+        feedback.reconcile_stale_trades()
+    except Exception as e:
+        logger.warning(f"Reconcile on startup failed (non-fatal): {e}")
 
     if args.once:
         run_cycle(pairs)

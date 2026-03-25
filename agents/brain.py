@@ -9,28 +9,153 @@ Improvements:
   - Structured 6-step analysis chain fed to Groq
 """
 import json
+import re
+import random
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from groq import Groq
 from loguru import logger
 import config
 from db import client as db
 
+_KEY_STATUS_FILE = Path("logs/groq_key_status.json")
+
+
+class GroqKeyManager:
+    """
+    Manages Groq API keys with persistent exhaustion tracking.
+
+    - Saves exhaustion state to logs/groq_key_status.json so restarts
+      don't retry keys that are known to be rate-limited.
+    - Starts on a random available key to spread load across keys.
+    - Parses retry-after from 429 errors to know exactly when a key resets.
+    """
+
+    def __init__(self, keys: list):
+        self.keys   = keys
+        self._state = self._load()
+        self._clean_expired()
+
+    # ── Persistence ───────────────────────────────────────────────────────
+
+    def _load(self) -> dict:
+        try:
+            if _KEY_STATUS_FILE.exists():
+                return json.loads(_KEY_STATUS_FILE.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _save(self):
+        try:
+            _KEY_STATUS_FILE.parent.mkdir(exist_ok=True)
+            _KEY_STATUS_FILE.write_text(json.dumps(self._state, indent=2))
+        except Exception as e:
+            logger.warning(f"[KeyManager] Could not save key state: {e}")
+
+    def _clean_expired(self):
+        """Remove keys whose reset time has already passed."""
+        now = datetime.now(timezone.utc)
+        expired = [
+            tail for tail, info in self._state.items()
+            if datetime.fromisoformat(info["reset_at"]) <= now
+        ]
+        for tail in expired:
+            del self._state[tail]
+            logger.info(f"[KeyManager] Key ...{tail} reset — marking available.")
+        if expired:
+            self._save()
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def available_keys(self) -> list:
+        """Return all keys that are not currently exhausted."""
+        self._clean_expired()
+        return [k for k in self.keys if k[-8:] not in self._state]
+
+    def pick_start_key(self) -> str:
+        """Return a random available key to spread load on startup."""
+        avail = self.available_keys()
+        if not avail:
+            raise RuntimeError(
+                "All Groq API keys are exhausted! "
+                f"Run: python utils/check_groq_keys.py to see reset times."
+            )
+        chosen = random.choice(avail)
+        logger.info(
+            f"[KeyManager] Starting with key ...{chosen[-4:]} "
+            f"({len(avail)}/{len(self.keys)} available)"
+        )
+        return chosen
+
+    def next_available(self, current_key: str) -> str | None:
+        """Return next available key after current, or None if all exhausted."""
+        avail = self.available_keys()
+        avail = [k for k in avail if k != current_key]
+        if not avail:
+            return None
+        return avail[0]
+
+    def mark_rate_limited(self, key: str, error_msg: str = ""):
+        """
+        Mark a key as exhausted. Parses retry-after seconds from error message.
+        Falls back to 60s (per-minute limit) or 86400s (daily limit) if unknown.
+        """
+        # Try to parse "Please try again in X.XXXs" from Groq error message
+        seconds = None
+        m = re.search(r"try again in ([\d.]+)s", error_msg, re.IGNORECASE)
+        if m:
+            seconds = float(m.group(1))
+        else:
+            # Heuristic: if error mentions 'day' or 'daily' → daily reset
+            if "day" in error_msg.lower() or "daily" in error_msg.lower():
+                seconds = 86400
+            else:
+                seconds = 65   # per-minute limit — wait 65s to be safe
+
+        reset_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        tail = key[-8:]
+        self._state[tail] = {"reset_at": reset_at.isoformat()}
+        self._save()
+        logger.warning(
+            f"[KeyManager] Key ...{key[-4:]} rate-limited. "
+            f"Available again in {seconds:.0f}s "
+            f"(~{reset_at.strftime('%H:%M:%S UTC')})"
+        )
+
+    def status_summary(self) -> str:
+        self._clean_expired()
+        avail = len(self.available_keys())
+        total = len(self.keys)
+        exhausted = [
+            f"...{tail[-4:]} until {info['reset_at'][11:19]} UTC"
+            for tail, info in self._state.items()
+        ]
+        line = f"{avail}/{total} keys available"
+        if exhausted:
+            line += " | Exhausted: " + ", ".join(exhausted)
+        return line
+
 
 class TradingBrain:
     def __init__(self):
-        self._keys = config.GROQ_API_KEYS
-        self._current_key_index = 0
+        self._key_mgr     = GroqKeyManager(config.GROQ_API_KEYS)
+        self._current_key = self._key_mgr.pick_start_key()
         self._init_client()
 
     def _init_client(self):
-        key = self._keys[self._current_key_index]
-        self.groq = Groq(api_key=key)
-        logger.info(f"Using Groq API Key #{self._current_key_index + 1} (ends in ...{key[-4:]})")
+        self.groq = Groq(api_key=self._current_key)
 
-    def _rotate_key(self):
-        if len(self._keys) > 1:
-            self._current_key_index = (self._current_key_index + 1) % len(self._keys)
+    def _rotate_key(self, error_msg: str = "") -> bool:
+        """Mark current key as rate-limited and switch to next available."""
+        self._key_mgr.mark_rate_limited(self._current_key, error_msg)
+        nxt = self._key_mgr.next_available(self._current_key)
+        if nxt:
+            self._current_key = nxt
             self._init_client()
+            logger.info(f"[KeyManager] Switched to key ...{nxt[-4:]} | {self._key_mgr.status_summary()}")
             return True
+        logger.error(f"[KeyManager] All keys exhausted! {self._key_mgr.status_summary()}")
         return False
 
     # ── Prompt Builder ────────────────────────────────────────────────────
@@ -96,13 +221,27 @@ class TradingBrain:
             "MIXED"
         )
 
-        prompt = f"""You are an elite cryptocurrency trading analyst managing a live account.
-Your job: conduct rigorous multi-factor research and output a precise, actionable decision.
+        lev      = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+        sl_pct   = config.STOP_LOSS_PCT * 100
+        tp_pct   = config.TAKE_PROFIT_PCT * 100
+        trade_usdt = max(bal * config.MAX_POSITION_PCT, config.MIN_ORDER_USDT) if bal else config.MIN_ORDER_USDT
+        mode_line = (
+            f"FUTURES {lev}x | Deploying ~${trade_usdt:.2f} USDT | "
+            f"Auto-exit: SL=-{sl_pct:.1f}% (real -{sl_pct*lev:.0f}%) / TP=+{tp_pct:.1f}% (real +{tp_pct*lev:.0f}%)"
+            if config.TRADE_MODE == "futures"
+            else f"SPOT | Deploying ~${trade_usdt:.2f} USDT | SL=-{sl_pct:.1f}% / TP=+{tp_pct:.1f}%"
+        )
+
+        prompt = f"""You are an elite cryptocurrency FUTURES trader managing a live account.
+Your job: conduct rigorous multi-factor research and deliver a precise short-term directional call.
+BUY = open a LONG (profit if price rises). SELL = open a SHORT (profit if price falls).
+Both directions are equally valid — choose based on evidence, not bias.
 
 ══════════════════════════════════════════════════════════════
 MARKET SNAPSHOT — {pair} @ ${price:,.4f}
 Time: {snapshot.get('timestamp')}  |  USDT Balance: ${bal:.4f}
 24h: High=${s24.get('high_24h','?')} | Low=${s24.get('low_24h','?')} | Change={s24.get('price_change_pct_24h','?')}%
+Trade context: {mode_line}
 ══════════════════════════════════════════════════════════════
 
 ▶ MARKET REGIME & TREND STRENGTH:
@@ -151,40 +290,43 @@ Time: {snapshot.get('timestamp')}  |  USDT Balance: ${bal:.4f}
 {news_lines}{feedback_lines}
 
 ══════════════════════════════════════════════════════════════
-YOUR 6-STEP ANALYSIS TASK
+YOUR 6-STEP ANALYSIS TASK  (SHORT-TERM FUTURES — 10 to 40 min horizon)
 ══════════════════════════════════════════════════════════════
 
 STEP 1 — REGIME CHECK:
   Is the market trending (ADX>25) or ranging (ADX<20)?
-  Trending: trust EMA/MACD/DI signals. Ranging: trust RSI/StochRSI/BB mean-reversion.
+  Trending: trust EMA/MACD/DI signals for continuation.
+  Ranging: trust RSI/StochRSI/BB mean-reversion (buy oversold, SELL overbought).
 
-STEP 2 — MULTI-TIMEFRAME ALIGNMENT:
-  Do 1H and 4H agree? Contradictory timeframes = high uncertainty = HOLD or low confidence.
-  Specifically check: EMA trend, MACD cross, RSI zone on both timeframes.
+STEP 2 — DIRECTION ASSESSMENT (BUY or SELL equally valid):
+  Bullish signals  → BUY/LONG:  rising EMA, bullish MACD cross, RSI<50 recovering, OBV up, +DI>-DI.
+  Bearish signals  → SELL/SHORT: falling EMA, bearish MACD cross, RSI>70 rolling over, OBV down, -DI>+DI.
+  Do 1H and 4H agree on direction? If both bearish → SELL. If both bullish → BUY. Mixed → HOLD.
 
 STEP 3 — VOLUME CONFIRMATION:
-  Does volume confirm the price move? OBV trend matches price trend?
-  Volume-confirmed moves are far more reliable than low-volume signals.
+  Does volume confirm the move? OBV trend matches price direction?
+  Volume spike in direction of trade = higher confidence. Divergence = reduce confidence.
 
 STEP 4 — NEWS CATALYST ASSESSMENT:
-  Are there high-impact catalysts? Strong news can override technicals.
-  "No news" during a move = technically driven = more predictable.
+  High-impact bearish news = short opportunity. High-impact bullish news = long opportunity.
+  No news = technically driven move = more predictable short-term.
 
-STEP 5 — HYPOTHESIS & ENTRY LOGIC:
-  Form ONE clear hypothesis. State: what, why, and at what price it breaks.
-  Consider risk/reward: distance to resistance vs distance to support.
+STEP 5 — HYPOTHESIS & TRADE HORIZON:
+  Form ONE clear hypothesis for the next 10-40 MINUTES.
+  This is a short-term futures trade with automatic TP/SL exits.
+  Estimate how many minutes you expect before price hits TP or SL.
   Only trade if R:R > 1.5:1 and you have conviction.
 
 STEP 6 — CONFIDENCE CALIBRATION:
   Start at 50%. Adjust:
-  +15 if 1H and 4H fully agree
-  +10 if volume confirms (OBV trend matches + volume spike)
+  +15 if 1H and 4H fully agree on direction (both bullish = BUY, both bearish = SELL)
+  +10 if volume confirms (OBV matches + volume spike)
   +10 if strong news catalyst aligns with direction
-  +10 if market regime matches strategy (trending→trend-follow, ranging→mean-revert)
+  +10 if market regime matches strategy (trending→follow trend, ranging→fade extremes)
   -15 if timeframes contradict
-  -10 if high ATR% (>2%) = wide outcomes
-  -10 if Fear&Greed extreme opposite to your direction
-  Final confidence must reflect genuine conviction. Be honest.
+  -10 if high ATR% (>2%) = unpredictable short-term swings
+  -10 if signals are mixed with no dominant direction
+  Final confidence must reflect genuine conviction. Bearish markets deserve SELL — do not force BUY.
 
 Respond ONLY with a JSON object (no markdown, no text outside JSON):
 {{
@@ -198,6 +340,7 @@ Respond ONLY with a JSON object (no markdown, no text outside JSON):
   "invalidation": "<exactly what would prove you wrong>",
   "risk_reward_ratio": <float, e.g. 2.0>,
   "market_context": "bullish" or "bearish" or "neutral",
+  "trade_horizon_minutes": <integer 10-40, your expected time to TP or SL>,
   "reasoning": "<your full step-by-step reasoning from all 6 steps, 5-8 sentences>"
 }}"""
 
@@ -233,12 +376,15 @@ Respond ONLY with a JSON object (no markdown, no text outside JSON):
                         {
                             "role": "system",
                             "content": (
-                                "You are a decisive professional crypto trading analyst. "
+                                "You are a decisive professional crypto FUTURES trader. "
                                 "Always respond with valid JSON only — no markdown, no preamble. "
-                                "You MUST find the dominant signal and act on it. "
-                                "HOLD is only valid when signals are truly 50/50. "
-                                "Extreme Fear (FnG<25) + strong order book buy pressure is a BUY signal. "
-                                "Do not be paralysed by uncertainty — make a call."
+                                "BUY = open a LONG (profit if price rises). "
+                                "SELL = open a SHORT (profit if price falls). "
+                                "Both directions are equally valid — choose based on evidence, not habit. "
+                                "Bearish technicals (falling EMA, bearish MACD, RSI>70 rolling over, -DI>+DI) = SELL/SHORT. "
+                                "Bullish technicals (rising EMA, bullish MACD, RSI recovering, +DI>-DI) = BUY/LONG. "
+                                "HOLD only when signals genuinely conflict with no clear dominant direction. "
+                                "Never default to BUY — if the market is falling, SELL is the correct call."
                             ),
                         },
                         {"role": "user", "content": prompt},
@@ -250,9 +396,7 @@ Respond ONLY with a JSON object (no markdown, no text outside JSON):
             except Exception as e:
                 # If we hit a rate limit (429), try rotating the key
                 if "rate_limit_exceeded" in str(e).lower() or "429" in str(e):
-                    logger.warning(f"Rate limit hit on key #{self._current_key_index + 1}. Attempting rotation...")
-                    if self._rotate_key():
-                        # Retry immediately with the new key
+                    if self._rotate_key(str(e)):
                         return _get_completion()
                 raise e
 
@@ -270,7 +414,8 @@ Respond ONLY with a JSON object (no markdown, no text outside JSON):
                 f"| Regime: {reasoning.get('market_regime')} "
                 f"| Alignment: {reasoning.get('signal_alignment')} "
                 f"| Risk: {reasoning.get('risk_level')} "
-                f"| R:R={reasoning.get('risk_reward_ratio','?')}"
+                f"| R:R={reasoning.get('risk_reward_ratio','?')} "
+                f"| Horizon: ~{reasoning.get('trade_horizon_minutes','?')}min"
             )
             logger.info(f"[{pair}] Hypothesis: {reasoning.get('hypothesis')}")
 
