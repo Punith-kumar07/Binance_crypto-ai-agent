@@ -57,10 +57,16 @@ async def get_status():
                 if qty != 0:
                     entry = float(pos["entryPrice"])
                     mark  = float(pos["markPrice"])
-                    pnl_pct_lev = (mark - entry) / entry * 100 * config.FUTURES_LEVERAGE if entry else 0
+                    side = "LONG" if qty > 0 else "SHORT"
+                    raw_pnl = (
+                        (mark - entry) / entry * 100 if qty > 0
+                        else (entry - mark) / entry * 100
+                    ) if entry else 0
+                    pnl_pct_lev = raw_pnl * config.FUTURES_LEVERAGE
                     positions.append({
                         "pair":            pos["symbol"],
                         "qty":             qty,
+                        "side":            side,
                         "entry":           entry,
                         "mark":            mark,
                         "pnl_pct":         round(pnl_pct_lev, 2),
@@ -197,15 +203,22 @@ async def close_position(pair: str):
         if config.TRADE_MODE == "futures":
             for o in c.futures_get_open_orders(symbol=pair):
                 c.futures_cancel_order(symbol=pair, orderId=o["orderId"])
-            qty = 0.0
+            qty        = 0.0
+            close_side = "SELL"
             for pos in c.futures_position_information(symbol=pair):
-                if float(pos.get("positionAmt", 0)) > 0:
-                    qty = float(pos["positionAmt"])
+                pos_amt = float(pos.get("positionAmt", 0))
+                if pos_amt > 0:      # LONG — close with SELL
+                    qty        = pos_amt
+                    close_side = "SELL"
+                    break
+                elif pos_amt < 0:   # SHORT — close with BUY
+                    qty        = abs(pos_amt)
+                    close_side = "BUY"
                     break
             if qty <= 0:
                 return {"success": False, "message": "No open futures position found"}
             result = c.futures_create_order(
-                symbol=pair, side="SELL", type="MARKET",
+                symbol=pair, side=close_side, type="MARKET",
                 quantity=qty, reduceOnly="true",
             )
         else:
@@ -238,16 +251,20 @@ async def close_position(pair: str):
         try:
             open_trades = (
                 db.get_client().table("trade_history")
-                .select("id,entry_price")
+                .select("id,entry_price,side")
                 .eq("pair", pair)
                 .is_("closed_at", "null")
                 .execute()
             ).data or []
             for trade in open_trades:
-                entry = float(trade.get("entry_price") or 0)
-                pnl_pct = None
+                entry    = float(trade.get("entry_price") or 0)
+                t_side   = trade.get("side", "BUY")
+                pnl_pct  = None
                 if exit_price and entry:
-                    raw = (exit_price - entry) / entry * 100
+                    raw = (
+                        (exit_price - entry) / entry * 100 if t_side == "BUY"
+                        else (entry - exit_price) / entry * 100
+                    )
                     lev = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
                     pnl_pct = round(raw * lev, 4)
                 update = {"closed_at": "now()", "outcome": "manual_close"}

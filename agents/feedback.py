@@ -45,7 +45,10 @@ class FeedbackLoop:
         """Simulate TP/SL check for dry-run trades using current market price."""
         pair = trade.get("pair")
         try:
-            ticker = self.binance.get_symbol_ticker(symbol=pair)
+            if config.TRADE_MODE == "futures":
+                ticker = self.binance.futures_symbol_ticker(symbol=pair)
+            else:
+                ticker = self.binance.get_symbol_ticker(symbol=pair)
             current_price = float(ticker["price"])
             
             # Log progress for dry-runs to provide visibility
@@ -220,13 +223,19 @@ class FeedbackLoop:
 
                     self._close_confirmed_trade(trade, exit_price)
                 else:
-                    pnl_pct = (mark_price - entry) / entry * 100 if entry else 0
+                    side    = trade.get("side", "BUY")
+                    pnl_pct = (
+                        (mark_price - entry) / entry * 100 if side == "BUY"
+                        else (entry - mark_price) / entry * 100
+                    ) * (config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1) if entry else 0
                     unrl = float(pos.get("unRealizedProfit", 0))
                     tp   = float(trade.get("take_profit_price", 0))
                     sl   = float(trade.get("stop_loss_price", 0))
+                    direction_label = "LONG" if side == "BUY" else "SHORT"
                     logger.info(
-                        f"[{pair}] Futures open | Mark=${mark_price:,.2f} | PnL={pnl_pct:+.2f}% "
-                        f"(unrealized ${unrl:+.4f}) | TP=${tp:,.2f} | SL=${sl:,.2f}"
+                        f"[{pair}] Futures {direction_label} open | Mark=${mark_price:,.2f} "
+                        f"| PnL={pnl_pct:+.2f}% (unrealized ${unrl:+.4f}) "
+                        f"| TP=${tp:,.2f} | SL=${sl:,.2f}"
                     )
         except Exception as e:
             logger.error(f"[{pair}] Futures feedback check failed: {e}")

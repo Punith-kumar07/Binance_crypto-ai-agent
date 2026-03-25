@@ -78,34 +78,15 @@ class RiskManager:
             )
             return None
 
-        # ── Gate 4: Position Management ─────────────────────────────────────
+        # ── Gate 4: No double-position on same pair ─────────────────────────
         open_trades = db.get_open_trades(pair)
-        
-        if direction == "BUY":
-            if open_trades:
-                logger.info(f"[{pair}] ❌ REJECT: Already have {len(open_trades)} open position(s). Skipping BUY.")
-                return None
-        elif direction == "SELL":
-            if not open_trades:
-                logger.info(f"[{pair}] ❌ REJECT: SELL signal but no open positions to close.")
-                return None
-            
-            # If we have open trades and get a SELL signal, we approve it to close positions
-            logger.info(f"[{pair}] 🔻 SELL signal received — closing {len(open_trades)} open position(s).")
-            # For a SELL (close), we use the full quantity of the first open trade found (simplified for now)
-            # In executor.py, it sells the full asset balance, so usdt_amount here is just for logging/records
-            trade = open_trades[0]
-            return TradeOrder(
-                pair=pair,
-                side="SELL",
-                usdt_amount=trade.get("usdt_value", 0),
-                entry_price=price,
-                stop_loss_price=0,
-                take_profit_price=0,
-                confidence=confidence,
-                reasoning=reasoning,
-                close_position_qty=trade.get("quantity", 0)
+        if open_trades:
+            logger.info(
+                f"[{pair}] ❌ REJECT: Already have {len(open_trades)} open position(s). "
+                f"Skipping {direction}."
             )
+            return None
+        # SELL now means open a SHORT (futures), not close an existing LONG.
 
         # ── Gate 5: Signal alignment check ──────────────────────────────────
         alignment = reasoning.get("signal_alignment", "mixed")

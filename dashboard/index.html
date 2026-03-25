@@ -190,11 +190,11 @@
           <div>
             <div class="flex items-center gap-2">
               <span class="text-white font-bold text-base">${pos.pair}</span>
-              <span class="text-xs px-2 py-0.5 rounded-full bg-blue-950 text-blue-300">
-                LONG ${pos.leverage}x
+              <span class="text-xs px-2 py-0.5 rounded-full ${pos.side==='SHORT' ? 'bg-red-950 text-red-300' : 'bg-blue-950 text-blue-300'}">
+                ${pos.side || 'LONG'} ${pos.leverage}x
               </span>
             </div>
-            <div class="text-gray-500 text-xs mt-0.5">${pos.qty} contracts</div>
+            <div class="text-gray-500 text-xs mt-0.5">${Math.abs(pos.qty)} contracts</div>
           </div>
           <div class="text-right">
             <div class="font-bold text-xl" style="color:${col}">
@@ -257,6 +257,9 @@
               <div class="flex items-center gap-2">
                 <span class="text-white font-bold text-base">${t.pair}</span>
                 <span class="text-xs px-2 py-0.5 rounded-full bg-yellow-950 text-yellow-400">DRY</span>
+                <span class="text-xs px-2 py-0.5 rounded-full ${t.side==='SELL' ? 'bg-red-950 text-red-300' : 'bg-blue-950 text-blue-300'}">
+                  ${t.side === 'SELL' ? 'SHORT' : 'LONG'}
+                </span>
               </div>
             </div>
             <div class="text-right">${pnlHtml}</div>

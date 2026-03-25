@@ -56,8 +56,9 @@ class TradeExecutor:
         if config.DRY_RUN:
             dry_id = f"DRY_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
             mode_label = f"FUTURES {config.FUTURES_LEVERAGE}x" if config.TRADE_MODE == "futures" else "SPOT"
+            side_label = "LONG" if order.side == "BUY" else "SHORT"
             logger.info(
-                f"[{order.pair}] 🧪 DRY RUN [{mode_label}] — would place {order.side} "
+                f"[{order.pair}] 🧪 DRY RUN [{mode_label}] — would open {side_label} "
                 f"{order.quantity:.6f} {order.pair.replace('USDT','')} "
                 f"| SL={order.stop_loss_price} TP={order.take_profit_price}"
             )
@@ -71,7 +72,7 @@ class TradeExecutor:
                 if order.side == "BUY":
                     result = self._execute_futures_buy(order, trade_record)
                 else:
-                    result = self._execute_futures_sell(order, trade_record)
+                    result = self._execute_futures_short(order, trade_record)
             else:
                 if order.side == "BUY":
                     result = self._execute_buy(order, trade_record)
@@ -406,11 +407,99 @@ class TradeExecutor:
         if trade_record["oco_protected"]:
             logger.info(f"[{pair}] ✅ Futures position fully protected (TP + SL on Binance servers)")
 
-    def _execute_futures_sell(self, order: TradeOrder, trade_record: dict) -> dict:
-        """Close an existing futures long position."""
+    def _execute_futures_short(self, order: TradeOrder, trade_record: dict) -> dict:
+        """Open a new SHORT (SELL) position on futures."""
         pair = order.pair
 
-        # Cancel all open futures orders (TP/SL) first
+        self.binance.futures_change_leverage(symbol=pair, leverage=config.FUTURES_LEVERAGE)
+        logger.info(f"[{pair}] Futures leverage set to {config.FUTURES_LEVERAGE}x")
+
+        ticker      = self.binance.futures_symbol_ticker(symbol=pair)
+        entry_price = float(ticker["price"])
+
+        notional = order.usdt_amount * config.FUTURES_LEVERAGE
+        qty      = self._round_quantity_futures(pair, notional / entry_price)
+        qty_str  = self._format_decimal(qty)
+
+        if qty <= 0:
+            raise ValueError(
+                f"Futures SHORT qty is 0 for {pair} — notional ${notional:.2f} below lot-size minimum"
+            )
+
+        logger.info(
+            f"[{pair}] Futures SHORT: margin=${order.usdt_amount:.2f} x {config.FUTURES_LEVERAGE}x "
+            f"= ${notional:.2f} notional | qty={qty_str}"
+        )
+
+        sell_result = self.binance.futures_create_order(
+            symbol=pair,
+            side="SELL",
+            type="MARKET",
+            quantity=qty_str,
+        )
+
+        filled_qty   = float(sell_result.get("executedQty", qty)) or qty
+        filled_price = float(sell_result.get("avgPrice", 0)) or entry_price
+
+        # SHORT: SL is ABOVE entry, TP is BELOW entry
+        sl_price = round(filled_price * (1 + config.STOP_LOSS_PCT), 8)
+        tp_price = round(filled_price * (1 - config.TAKE_PROFIT_PCT), 8)
+
+        trade_record["entry_price"]        = filled_price
+        trade_record["quantity"]           = filled_qty
+        trade_record["stop_loss_price"]    = sl_price
+        trade_record["take_profit_price"]  = tp_price
+
+        logger.info(
+            f"[{pair}] SHORT fill: {filled_qty} @ {filled_price} "
+            f"| SL={sl_price} (above) | TP={tp_price} (below)"
+        )
+
+        self._place_futures_short_exit_orders(pair, sl_price, tp_price, trade_record)
+        return sell_result
+
+    def _place_futures_short_exit_orders(self, pair, sl_price, tp_price, trade_record):
+        """Place server-side TP and SL for a SHORT position (BUY-side close orders)."""
+        sl_str = self._format_decimal(self._round_price_futures(pair, sl_price))
+        tp_str = self._format_decimal(self._round_price_futures(pair, tp_price))
+
+        tp_ok = sl_ok = False
+
+        try:
+            self.binance.futures_create_order(
+                symbol=pair,
+                side="BUY",
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=tp_str,
+                closePosition="true",
+                workingType="MARK_PRICE",
+            )
+            logger.info(f"[{pair}] ✅ SHORT TP placed: {tp_str} (BUY at price drop)")
+            tp_ok = True
+        except BinanceAPIException as e:
+            logger.error(f"[{pair}] ❌ SHORT TP failed ({e.code}: {e.message})")
+
+        try:
+            self.binance.futures_create_order(
+                symbol=pair,
+                side="BUY",
+                type="STOP_MARKET",
+                stopPrice=sl_str,
+                closePosition="true",
+                workingType="MARK_PRICE",
+            )
+            logger.info(f"[{pair}] ✅ SHORT SL placed: {sl_str} (BUY at price rise)")
+            sl_ok = True
+        except BinanceAPIException as e:
+            logger.error(f"[{pair}] ❌ SHORT SL failed ({e.code}: {e.message})")
+
+        trade_record["oco_protected"] = tp_ok and sl_ok
+        if trade_record["oco_protected"]:
+            logger.info(f"[{pair}] ✅ SHORT position fully protected (TP + SL on Binance servers)")
+
+    def _execute_futures_close_position(self, pair: str, trade_record: dict) -> dict:
+        """Close any open futures position (LONG or SHORT) using reduceOnly."""
+        # Cancel all open TP/SL orders first
         try:
             open_orders = self.binance.futures_get_open_orders(symbol=pair)
             for o in open_orders:
@@ -419,14 +508,20 @@ class TradeExecutor:
         except Exception as e:
             logger.warning(f"[{pair}] Could not cancel futures orders: {e}")
 
-        # Get actual position size
+        # Detect position direction from positionAmt sign
         try:
             positions = self.binance.futures_position_information(symbol=pair)
-            qty = 0.0
+            qty        = 0.0
+            close_side = "SELL"
             for pos in positions:
                 pos_amt = float(pos.get("positionAmt", 0))
-                if pos_amt > 0:
-                    qty = pos_amt
+                if pos_amt > 0:          # long
+                    qty        = pos_amt
+                    close_side = "SELL"
+                    break
+                elif pos_amt < 0:        # short
+                    qty        = abs(pos_amt)
+                    close_side = "BUY"
                     break
         except Exception as e:
             logger.error(f"[{pair}] Could not get futures position: {e}")
@@ -436,16 +531,16 @@ class TradeExecutor:
             logger.warning(f"[{pair}] No open futures position to close.")
             return {"orderId": "ALREADY_CLOSED", "status": "FILLED"}
 
-        qty_str = self._format_decimal(self._round_quantity_futures(pair, qty))
-        sell_result = self.binance.futures_create_order(
+        qty_str    = self._format_decimal(self._round_quantity_futures(pair, qty))
+        result     = self.binance.futures_create_order(
             symbol=pair,
-            side="SELL",
+            side=close_side,
             type="MARKET",
             quantity=qty_str,
             reduceOnly="true",
         )
-        logger.info(f"[{pair}] ✅ Futures position closed: {sell_result.get('orderId')}")
+        logger.info(f"[{pair}] ✅ Futures position closed ({close_side}): {result.get('orderId')}")
 
         trade_record["oco_protected"] = False
-        trade_record["quantity"] = qty
-        return sell_result
+        trade_record["quantity"]      = qty
+        return result
