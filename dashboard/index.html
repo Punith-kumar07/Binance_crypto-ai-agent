@@ -240,7 +240,10 @@
         const lev    = lastCfg.leverage || 1;
         const cur    = (prices || {})[t.pair] || 0;
         const hasPx  = cur > 0 && entry > 0;
-        const pnlPct = hasPx ? (cur - entry) / entry * 100 * lev : null;
+        const isShort = t.side === 'SELL';
+        const pnlPct = hasPx
+          ? (isShort ? (entry - cur) : (cur - entry)) / entry * 100 * lev
+          : null;
         const up     = pnlPct >= 0;
         const col    = pnlPct === null ? '#9ca3af' : up ? '#22c55e' : '#ef4444';
         const bord   = pnlPct === null ? 'border-yellow-900' : up ? 'border-green-900' : 'border-red-900';
