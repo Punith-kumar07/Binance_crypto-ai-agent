@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import config
 from db import client as db
+from notifications import telegram as tg
 
 
 @dataclass
@@ -63,6 +64,7 @@ class RiskManager:
             logger.warning(
                 f"[{pair}] ❌ REJECT: Daily loss limit reached ({daily_pnl:.2f}% <= {config.MAX_DAILY_LOSS_PCT}%)"
             )
+            tg.notify_daily_limit_hit(daily_pnl)
             return None
 
         # ── Gate 2: Direction must be actionable ────────────────────────────

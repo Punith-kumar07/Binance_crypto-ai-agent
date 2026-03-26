@@ -71,6 +71,11 @@ def run_cycle(pairs: list = None):
     logger.info(f"   Pool: {len(config.TRADING_PAIRS)} pairs | Scan/cycle: {config.SCAN_PAIRS_PER_CYCLE} | DRY_RUN: {config.DRY_RUN}")
     logger.info("=" * 60)
 
+    # ── Pause check ──────────────────────────────────────────────────────────
+    if tg.is_paused():
+        logger.info("⏸ Agent is PAUSED via Telegram — skipping cycle.")
+        return
+
     # ── Step 10: feedback loop ───────────────────────────────────────────────
     logger.info("🔁 [Feedback] Checking open positions...")
     try:

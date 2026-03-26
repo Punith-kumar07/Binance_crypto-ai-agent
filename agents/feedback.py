@@ -153,6 +153,7 @@ class FeedbackLoop:
             pnl_pct=pnl_pct,
             outcome="win" if hit_tp else "loss",
             is_dry=trade.get("is_dry_run", False),
+            usdt_amount=float(trade.get("usdt_value", 0) or 0),
         )
 
         # Update the AI reasoning record so the agent learns from this outcome
@@ -216,6 +217,7 @@ class FeedbackLoop:
             pnl_pct=pnl_pct,
             outcome=outcome,
             is_dry=trade.get("is_dry_run", False),
+            usdt_amount=float(trade.get("usdt_value", 0) or 0),
         )
 
         reasoning_id = trade.get("reasoning_id")

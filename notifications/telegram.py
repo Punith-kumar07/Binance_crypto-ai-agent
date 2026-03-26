@@ -6,6 +6,9 @@ Features:
   - Live 20-second PnL updates on the trade-open message (edits in-place)
   - Inline "Close Position" button — works for both live futures and dry-run
   - Background callback poller (long-polling, no webhook needed)
+  - Commands: /status, /balance, /pause, /resume
+  - Daily loss limit halt alert
+  - USDT PnL shown on trade close
 
 Setup (one-time):
   1. Message @BotFather on Telegram → /newbot → copy the token
@@ -33,6 +36,22 @@ _monitors: dict  = {}   # pair → {message_id, stop_event, side, entry, ...}
 _poll_offset: int = 0
 _poll_thread: threading.Thread | None = None
 _bc = None              # cached Binance client
+
+_paused      = False
+_paused_lock = threading.Lock()
+
+
+# ── Pause / resume (checked by main.py each cycle) ─────────────────────────
+
+def is_paused() -> bool:
+    with _paused_lock:
+        return _paused
+
+
+def _set_paused(state: bool):
+    global _paused
+    with _paused_lock:
+        _paused = state
 
 
 # ── Low-level API helpers ───────────────────────────────────────────────────
@@ -116,10 +135,11 @@ def _build_trade_text(
 
     if current_price is not None and pnl_pct is not None:
         pnl_icon = "🟢" if pnl_pct >= 0 else "🔴"
+        pnl_usdt = pnl_pct / 100 * usdt_amount
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         text += (
             f"\n\n{pnl_icon} <b>Mark:</b>  <code>${current_price:,.4f}</code>"
-            f"   PnL: <b>{pnl_pct:+.2f}%</b>\n"
+            f"   PnL: <b>{pnl_pct:+.2f}%</b>  (<b>{pnl_usdt:+.3f} USDT</b>)\n"
             f"<i>⟳ {ts}  (update #{update_n})</i>"
         )
     return text
@@ -145,6 +165,82 @@ def _get_price(pair: str) -> float | None:
     except Exception as e:
         logger.debug(f"[Telegram] price fetch {pair}: {e}")
         return None
+
+
+def _fetch_balance() -> float | None:
+    """Fetch available USDT balance from Binance futures or spot wallet."""
+    try:
+        c = _binance()
+        if config.TRADE_MODE == "futures":
+            for asset in c.futures_account_balance():
+                if asset["asset"] == "USDT":
+                    return float(asset["availableBalance"])
+        else:
+            info = c.get_asset_balance(asset="USDT")
+            return float(info["free"]) if info else None
+    except Exception as e:
+        logger.debug(f"[Telegram] balance fetch error: {e}")
+    return None
+
+
+# ── Status builder ──────────────────────────────────────────────────────────
+
+def _build_status_text() -> str:
+    lev      = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+    mode     = config.TRADE_MODE.upper()
+    dry_tag  = "🧪 DRY RUN" if config.DRY_RUN else "🔴 LIVE"
+    paused   = is_paused()
+
+    lines = [
+        f"📊 <b>Agent Status</b>",
+        f"Mode:    <b>{mode} {lev}x</b>  {dry_tag}",
+        f"State:   <b>{'⏸ PAUSED' if paused else '▶️ RUNNING'}</b>",
+        "",
+    ]
+
+    # Balance
+    bal = _fetch_balance()
+    if bal is not None:
+        lines.append(f"💰 <b>Balance:</b>  <code>${bal:.2f} USDT</code>")
+
+    # Daily PnL across all pairs
+    try:
+        from db import client as db
+        total_pnl = sum(db.get_daily_pnl_pct(p) for p in config.TRADING_PAIRS)
+        pnl_icon  = "🟢" if total_pnl >= 0 else "🔴"
+        lines.append(f"{pnl_icon} <b>Daily PnL:</b>  <b>{total_pnl:+.2f}%</b>  (limit: {config.MAX_DAILY_LOSS_PCT}%)")
+    except Exception:
+        pass
+
+    lines.append("")
+
+    # Open positions
+    if _monitors:
+        lines.append(f"📂 <b>Open positions ({len(_monitors)}):</b>")
+        for pair, m in _monitors.items():
+            price = _get_price(pair)
+            dir_label = "LONG" if m["side"] == "BUY" else "SHORT"
+            lev_n = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+            if price:
+                pnl = (
+                    (price - m["entry"]) / m["entry"] * 100 * lev_n if m["side"] == "BUY"
+                    else (m["entry"] - price) / m["entry"] * 100 * lev_n
+                )
+                pnl_usdt = pnl / 100 * m["usdt_amount"]
+                pnl_icon = "🟢" if pnl >= 0 else "🔴"
+                lines.append(
+                    f"  {pnl_icon} <b>{pair}</b> {dir_label}  "
+                    f"<code>${price:,.4f}</code>  "
+                    f"PnL: <b>{pnl:+.2f}%</b> (<b>{pnl_usdt:+.3f} USDT</b>)"
+                )
+            else:
+                lines.append(f"  ⚪ <b>{pair}</b> {dir_label}  entry <code>${m['entry']:,.4f}</code>")
+    else:
+        lines.append("📂 <b>No open positions</b>")
+
+    lines.append("")
+    lines.append("<i>Commands: /pause · /resume · /balance · /status</i>")
+    return "\n".join(lines)
 
 
 # ── Position monitor (background thread per open trade) ─────────────────────
@@ -184,7 +280,7 @@ def stop_monitor(pair: str):
         m["stop_event"].set()
 
 
-# ── Callback poller (background thread, started once on agent startup) ───────
+# ── Callback & message poller ────────────────────────────────────────────────
 
 def _poll_loop():
     global _poll_offset
@@ -194,12 +290,49 @@ def _poll_loop():
             updates = _get_updates(_poll_offset)
             for upd in updates:
                 _poll_offset = upd["update_id"] + 1
-                cb = upd.get("callback_query")
+                cb  = upd.get("callback_query")
+                msg = upd.get("message")
                 if cb:
                     _handle_callback(cb)
+                elif msg:
+                    _handle_message(msg)
         except Exception as e:
             logger.warning(f"[Telegram] Poll loop error: {e}")
             time.sleep(5)
+
+
+def _handle_message(msg: dict):
+    """Handle text commands sent directly to the bot."""
+    text    = (msg.get("text") or "").strip().lower().split("@")[0]  # strip @botname suffix
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+    # Only respond to our configured chat
+    if chat_id != str(config.TELEGRAM_CHAT_ID):
+        return
+
+    if text == "/pause":
+        _set_paused(True)
+        _send("⏸ <b>Agent paused.</b> No new trades will be opened.\nSend /resume to restart.")
+    elif text == "/resume":
+        _set_paused(False)
+        _send("▶️ <b>Agent resumed.</b> Trading is active again.")
+    elif text == "/balance":
+        bal = _fetch_balance()
+        if bal is not None:
+            _send(f"💰 <b>Balance:</b>  <code>${bal:.2f} USDT</code>")
+        else:
+            _send("❌ Could not fetch balance — check Binance API connection.")
+    elif text == "/status":
+        _send(_build_status_text())
+    elif text == "/help" or text == "/start":
+        _send(
+            "🤖 <b>Crypto AI Agent — Commands</b>\n\n"
+            "/status  — positions, balance, daily PnL\n"
+            "/balance — wallet balance\n"
+            "/pause   — stop opening new trades\n"
+            "/resume  — resume trading\n\n"
+            "<i>Use the inline Close button on trade alerts to close a position.</i>"
+        )
 
 
 def _handle_callback(cb: dict):
@@ -294,7 +427,8 @@ def notify_startup(pairs: list, dry_run: bool, mode: str, leverage: int):
     _send(
         f"🤖 <b>Crypto AI Agent Started</b>\n"
         f"Mode: <b>{mode.upper()} {leverage}x</b>  {dry_label}\n"
-        f"Scanning: <code>{', '.join(pairs)}</code>"
+        f"Scanning: <code>{', '.join(pairs)}</code>\n\n"
+        f"<i>/status · /balance · /pause · /resume</i>"
     )
 
 
@@ -350,6 +484,7 @@ def notify_trade_close(
     pnl_pct: float,
     outcome: str,
     is_dry: bool,
+    usdt_amount: float = 0.0,
 ):
     stop_monitor(pair)   # kill the live-update thread
 
@@ -361,11 +496,27 @@ def notify_trade_close(
     else:
         icon, label = "🟡", "MANUAL CLOSE"
 
-    dry_tag = " 🧪" if is_dry else ""
+    dry_tag  = " 🧪" if is_dry else ""
+    pnl_usdt = pnl_pct / 100 * usdt_amount if usdt_amount else None
+
+    pnl_line = f"PnL:    <b>{pnl_pct:+.2f}%</b>"
+    if pnl_usdt is not None:
+        pnl_line += f"  (<b>{pnl_usdt:+.3f} USDT</b>)"
+
     _send(
         f"{icon} <b>{pair} {dir_label} CLOSED</b>{dry_tag}\n"
         f"{label}\n"
         f"Entry:  <code>${entry:,.4f}</code>\n"
         f"Exit:   <code>${exit_price:,.4f}</code>\n"
-        f"PnL:    <b>{pnl_pct:+.2f}%</b>"
+        f"{pnl_line}"
+    )
+
+
+def notify_daily_limit_hit(daily_pnl: float):
+    """Alert when the daily loss limit is reached and the agent halts trading."""
+    _send(
+        f"🚨 <b>Daily Loss Limit Hit</b>\n"
+        f"Daily PnL: <b>{daily_pnl:+.2f}%</b>  (limit: {config.MAX_DAILY_LOSS_PCT}%)\n"
+        f"Agent will <b>not open new trades</b> until tomorrow.\n\n"
+        f"<i>Use /status to monitor. Agent resumes automatically at midnight UTC.</i>"
     )
