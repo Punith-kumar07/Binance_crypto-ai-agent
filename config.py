@@ -20,6 +20,25 @@ if not GROQ_API_KEYS and os.getenv("GROQ_API_KEY"):
 
 GROQ_MODEL         = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+# ── OpenRouter (2nd fallback: Groq exhausted → OpenRouter → Gemini) ────────
+# Free models: https://openrouter.ai/models?q=free
+OPENROUTER_API_KEYS   = [k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()]
+OPENROUTER_MODEL      = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_HOURLY_LIMIT = int(os.getenv("OPENROUTER_HOURLY_LIMIT", "40"))
+
+# ── Gemini (3rd fallback when all Groq + OpenRouter keys are exhausted) ─────
+# Supports multiple keys: GEMINI_API_KEYS=key1,key2,key3
+GEMINI_API_KEYS    = [k.strip() for k in os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", "")).split(",") if k.strip()]
+GEMINI_API_KEY     = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else ""   # backward compat
+GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_HOURLY_LIMIT = int(os.getenv("GEMINI_HOURLY_LIMIT", "5"))  # max calls per hour per key
+
+# ── Browser AI (last-resort fallback — uses ChatGPT/Gemini web UI) ─────────
+# Set to "chatgpt" or "gemini" to enable. "off" to disable.
+# One-time setup: python agents/browser_ai.py --login chatgpt
+BROWSER_AI_PROVIDER = os.getenv("BROWSER_AI_PROVIDER", "off").lower()
+BROWSER_AI_HEADED   = os.getenv("BROWSER_AI_HEADED", "false").lower() == "true"
+
 # ── Supabase ───────────────────────────────────────────────────────────────
 SUPABASE_URL       = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY       = os.getenv("SUPABASE_KEY", "")
@@ -33,9 +52,22 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 
 # ── Agent behaviour ───────────────────────────────────────────────────────
 _DEFAULT_PAIRS = (
+    # ── Blue chips ──────────────────────────────────────────
     "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,"
-    "DOTUSDT,LINKUSDT,LTCUSDT,NEARUSDT,ATOMUSDT,INJUSDT,APTUSDT,"
-    "ARBUSDT,OPUSDT,SUIUSDT,TONUSDT,MATICUSDT,LDOUSDT"
+    # ── L1 / Infrastructure ─────────────────────────────────
+    "DOTUSDT,LINKUSDT,LTCUSDT,NEARUSDT,ATOMUSDT,INJUSDT,APTUSDT,SUIUSDT,TONUSDT,SEIUSDT,"
+    # ── L2 / Scaling ────────────────────────────────────────
+    "ARBUSDT,OPUSDT,POLUSDT,STXUSDT,"
+    # ── DeFi ────────────────────────────────────────────────
+    "LDOUSDT,AAVEUSDT,UNIUSDT,MKRUSDT,ENAUSDT,PENDLEUSDT,"
+    # ── AI / Data ───────────────────────────────────────────
+    "FETUSDT,GRTUSDT,WLDUSDT,PYTHUSDT,"
+    # ── Storage / Infra ─────────────────────────────────────
+    "FILUSDT,RUNEUSDT,TIAUSDT,ONDOUSDT,"
+    # ── Meme (high vol, predictable patterns) ───────────────
+    "1000PEPEUSDT,WIFUSDT,1000FLOKIUSDT,"
+    # ── Trending / Newer ────────────────────────────────────
+    "JUPUSDT,ORDIUSDT,JTOUSDT,IMXUSDT"
 )
 TRADING_PAIRS      = [p.strip() for p in os.getenv("TRADING_PAIRS", _DEFAULT_PAIRS).split(",") if p.strip()]
 SCAN_PAIRS_PER_CYCLE = int(os.getenv("SCAN_PAIRS_PER_CYCLE", "5"))   # pairs to analyse per cycle

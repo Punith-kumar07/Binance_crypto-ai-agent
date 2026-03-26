@@ -62,8 +62,10 @@ SCORE_VOLUME_SPIKE_MULTIPLIER  = 1.1
 
 # ── API / network ──────────────────────────────────────────────────────────
 API_TIMEOUT_SECONDS  = 10   # default requests timeout
-GROQ_MAX_TOKENS      = 1200
-GROQ_TEMPERATURE     = 0.4
+GROQ_MAX_TOKENS         = 1200
+OPENROUTER_MAX_TOKENS   = 2500   # free models are more verbose than Groq — needs more room
+GEMINI_MAX_TOKENS       = 8192   # Gemini responses are more verbose — needs higher limit
+GROQ_TEMPERATURE        = 0.4
 
 # Retry settings (via tenacity in brain.py)
 GROQ_RETRY_ATTEMPTS  = 3

@@ -75,11 +75,11 @@ def _get_updates(offset: int) -> list:
     return []
 
 
-def _send(text: str):
-    _api("sendMessage",
-         chat_id=config.TELEGRAM_CHAT_ID,
-         text=text,
-         parse_mode="HTML")
+def _send(text: str) -> dict | None:
+    return _api("sendMessage",
+                chat_id=config.TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode="HTML")
 
 
 # ── Keyboard & message builder ──────────────────────────────────────────────

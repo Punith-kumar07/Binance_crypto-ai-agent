@@ -1,8 +1,30 @@
+# Secrets & environment
 .env
+*.env.*
+!.env.example
+
+# Browser AI session (Chrome cookies / login state — never commit)
+browser_session/
+
+# Logs & runtime artifacts
 logs/
+*.log
+
+# Python
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
+*.pyd
+.Python
 *.egg-info/
+dist/
+build/
+
+# Virtual environments
 .venv/
 venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

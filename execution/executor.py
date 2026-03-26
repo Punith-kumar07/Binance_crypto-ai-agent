@@ -90,9 +90,17 @@ class TradeExecutor:
         except BinanceAPIException as e:
             logger.error(f"[{order.pair}] ❌ Binance error: {e.code} — {e.message}")
             trade_record["binance_order_id"] = f"FAILED_{e.code}"
+            trade_record["closed_at"] = datetime.now(timezone.utc).isoformat()
+            trade_record["outcome"] = "failed"
+            # -4140 = symbol suspended — flag so caller can apply long cooldown
+            if e.code == -4140:
+                trade_record["_symbol_suspended"] = True
+                logger.warning(f"[{order.pair}] ⚠️ Symbol suspended on Binance (-4140). Will skip for 24h.")
         except Exception as e:
             logger.error(f"[{order.pair}] ❌ Execution error: {e}")
             trade_record["binance_order_id"] = "FAILED_UNKNOWN"
+            trade_record["closed_at"] = datetime.now(timezone.utc).isoformat()
+            trade_record["outcome"] = "failed"
 
         db.log_trade(trade_record)
         return trade_record
@@ -326,7 +334,11 @@ class TradeExecutor:
 
         # Get current futures mark price
         ticker = self.binance.futures_symbol_ticker(symbol=pair)
-        entry_price = float(ticker["price"])
+        raw = ticker.get("price") or ticker.get("markPrice") or ticker.get("lastPrice")
+        if not raw:
+            mp = self.binance.futures_mark_price(symbol=pair)
+            raw = mp.get("markPrice") or mp.get("indexPrice")
+        entry_price = float(raw)
 
         # Notional = margin * leverage; qty = notional / price
         notional = order.usdt_amount * config.FUTURES_LEVERAGE
@@ -414,8 +426,12 @@ class TradeExecutor:
         self.binance.futures_change_leverage(symbol=pair, leverage=config.FUTURES_LEVERAGE)
         logger.info(f"[{pair}] Futures leverage set to {config.FUTURES_LEVERAGE}x")
 
-        ticker      = self.binance.futures_symbol_ticker(symbol=pair)
-        entry_price = float(ticker["price"])
+        ticker = self.binance.futures_symbol_ticker(symbol=pair)
+        raw = ticker.get("price") or ticker.get("markPrice") or ticker.get("lastPrice")
+        if not raw:
+            mp = self.binance.futures_mark_price(symbol=pair)
+            raw = mp.get("markPrice") or mp.get("indexPrice")
+        entry_price = float(raw)
 
         notional = order.usdt_amount * config.FUTURES_LEVERAGE
         qty      = self._round_quantity_futures(pair, notional / entry_price)

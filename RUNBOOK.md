@@ -8,6 +8,8 @@ This is an AI-powered futures trading agent for Binance. It uses Groq (LLaMA) fo
 - **Trading agent** — `main.py` (Python)
 - **Dashboard backend** — `dashboard/app.py` (FastAPI)
 - **Dashboard frontend** — `dashboard/index.html` (served at `http://localhost:8000`)
+- **AI brain** — `agents/brain.py` (Groq/LLaMA → OpenRouter → Browser AI fallback chain)
+- **Browser AI** — `agents/browser_ai.py` (Playwright — ChatGPT or Gemini fallback)
 - **Database** — Supabase (cloud Postgres)
 - **Exchange** — Binance Futures
 
@@ -20,6 +22,7 @@ This is an AI-powered futures trading agent for Binance. It uses Groq (LLaMA) fo
 - USDT transferred to your **Futures wallet** on Binance
 - Supabase project with `trade_history` table
 - Groq API key(s) from [console.groq.com](https://console.groq.com)
+- *(Optional)* Google Chrome installed — required only for Browser AI feature
 
 ---
 
@@ -27,6 +30,13 @@ This is an AI-powered futures trading agent for Binance. It uses Groq (LLaMA) fo
 
 ```bash
 pip install -r requirements.txt
+```
+
+If you plan to use the **Browser AI** feature (ChatGPT or Gemini fallback):
+
+```bash
+pip install playwright
+playwright install chromium
 ```
 
 ---
@@ -62,6 +72,10 @@ LOG_LEVEL=INFO
 # === TRADE MODE ===
 TRADE_MODE=futures               # "spot" or "futures"
 FUTURES_LEVERAGE=4               # 1–20x (set on Binance per symbol automatically)
+
+# === BROWSER AI (optional fallback) ===
+BROWSER_AI_PROVIDER=off          # "chatgpt", "gemini", or "off" (default)
+BROWSER_AI_HEADED=false          # true = show browser window (useful for debugging)
 ```
 
 > **Never commit `.env` to Git.** It is already in `.gitignore`.
@@ -96,6 +110,11 @@ Then open: **[http://localhost:8000](http://localhost:8000)**
 
 > The dashboard auto-refreshes every 5 seconds. Live logs stream via WebSocket.
 
+To kill any existing process on port 8000 before starting:
+```bash
+lsof -ti :8000 | xargs kill -9 2>/dev/null; sleep 1; python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8000
+```
+
 ---
 
 ## 5. Running Both Together
@@ -114,7 +133,81 @@ python -m uvicorn dashboard.app:app --host 0.0.0.0 --port 8000
 
 ---
 
-## 6. Utility Scripts
+## 6. Browser AI Feature
+
+The agent has a three-tier AI fallback chain:
+
+```
+Tier 1 → Groq (LLaMA) — fast, free, rate-limited
+Tier 2 → OpenRouter   — secondary API fallback
+Tier 3 → Browser AI   — uses ChatGPT or Gemini via your browser session
+```
+
+Browser AI kicks in automatically when all API-based providers fail or are rate-limited. It uses **Playwright** to control your real Chrome browser and send prompts to ChatGPT or Gemini — no API key required, just a logged-in browser session.
+
+### One-time setup
+
+**Step 1 — Install dependencies:**
+```bash
+pip install playwright
+playwright install chromium
+```
+
+**Step 2 — Log in and save your session:**
+
+For ChatGPT:
+```bash
+python agents/browser_ai.py --login chatgpt
+```
+
+For Gemini:
+```bash
+python agents/browser_ai.py --login gemini
+```
+
+A Chrome window will open. Log in to the site normally, then press **Ctrl+C** in the terminal when done. Your session is saved to `./browser_session/` and reused on all future runs.
+
+> **Note:** Uses your real system Chrome (`channel="chrome"`). Bundled Chromium is blocked by Google/OpenAI sign-in screens.
+
+### Enable in `.env`
+
+```env
+BROWSER_AI_PROVIDER=gemini    # or "chatgpt"
+BROWSER_AI_HEADED=false       # set true to watch the browser (debug)
+```
+
+Set `BROWSER_AI_PROVIDER=off` to disable (default).
+
+### Testing the browser AI manually
+
+Send a test prompt and see the raw JSON decision:
+```bash
+python agents/browser_ai.py --provider gemini --message "Test prompt" --headed
+```
+
+Without `--headed` it runs in headless (invisible) mode — same as during normal agent operation.
+
+### How it works
+
+- Each trading cycle that needs a browser AI decision opens a **new conversation** to avoid context bleed between pairs.
+- The AI is prompted with the same market data JSON as Groq/OpenRouter.
+- Response is expected as JSON (`{"direction": "LONG"|"SHORT"|"HOLD", "confidence": 0-100, ...}`).
+- If JSON parsing fails, it retries up to 2 times before returning HOLD.
+- The browser window stays open in the background after first use — subsequent calls are fast (~5–10s).
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `Browser did not become ready in 30s` | Session expired — re-run `--login` |
+| `Gemini input never appeared` | Session invalid — re-run `--login gemini` |
+| `Couldn't sign you in` (Chromium error) | Expected — always use `channel="chrome"` (system Chrome) |
+| Browser not opening on macOS | Ensure Chrome is installed at the default path |
+| `JSON parse error` after retries | Provider returned non-JSON (CAPTCHA/login wall) — re-run `--login` |
+
+---
+
+## 7. Utility Scripts
 
 ### View trade results
 ```bash
@@ -130,7 +223,7 @@ Marks all open trades as `cancelled` in Supabase. Use this before a fresh run.
 
 ---
 
-## 7. Dry Run → Live Checklist
+## 8. Dry Run → Live Checklist
 
 Before switching to live trading:
 
@@ -145,7 +238,7 @@ Before switching to live trading:
 
 ---
 
-## 8. Key Risk Settings Explained
+## 9. Key Risk Settings Explained
 
 | Setting | Effect |
 |---|---|
@@ -162,7 +255,7 @@ Before switching to live trading:
 
 ---
 
-## 9. Manually Closing a Position
+## 10. Manually Closing a Position
 
 **From the dashboard:** Click **✕ Close Position** on the position card — cancels TP/SL orders and market-closes immediately.
 
@@ -186,14 +279,15 @@ EOF
 
 ---
 
-## 10. File Structure
+## 11. File Structure
 
 ```
 crypto_agent/
 ├── main.py                  # Trading agent entry point
 ├── config.py                # Loads .env settings
 ├── agents/
-│   ├── brain.py             # AI analysis (Groq/LLaMA)
+│   ├── brain.py             # AI analysis (Groq → OpenRouter → Browser AI)
+│   ├── browser_ai.py        # Browser AI agent (ChatGPT / Gemini via Playwright)
 │   └── feedback.py          # TP/SL feedback loop
 ├── data/
 │   └── collector.py         # Market data + indicators
@@ -209,6 +303,7 @@ crypto_agent/
 ├── utils/
 │   ├── view_results.py      # Print trade history
 │   └── clear_trades.py      # Mark open trades as cancelled
+├── browser_session/         # Playwright Chrome session (gitignored)
 ├── logs/                    # Agent log files (gitignored)
 ├── requirements.txt
 └── .env                     # Secrets (gitignored)

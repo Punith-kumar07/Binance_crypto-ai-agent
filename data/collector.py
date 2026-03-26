@@ -9,6 +9,7 @@ Pulls from:
 
 No external TA library required — all indicators use pandas + numpy.
 """
+import math
 import requests
 import pandas as pd
 import numpy as np
@@ -21,6 +22,17 @@ import constants as C
 
 class DataCollectionError(RuntimeError):
     """Raised when a critical data fetch fails and the cycle cannot continue."""
+
+
+def _sanitize(obj):
+    """Recursively replace float NaN/Inf with None so the snapshot is JSON-safe."""
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 
 # ── Technical Indicator Implementations ───────────────────────────────────
@@ -164,6 +176,8 @@ class DataCollector:
             reraise=True
         )
         def _fetch():
+            if config.TRADE_MODE == "futures":
+                return self.binance.futures_klines(symbol=pair, interval=interval, limit=limit)
             return self.binance.get_klines(symbol=pair, interval=interval, limit=limit)
 
         try:
@@ -195,8 +209,17 @@ class DataCollector:
             reraise=False
         )
         def _fetch():
-            ticker = self.binance.get_symbol_ticker(symbol=pair)
-            return float(ticker["price"])
+            if config.TRADE_MODE == "futures":
+                ticker = self.binance.futures_symbol_ticker(symbol=pair)
+                # futures_symbol_ticker → 'price'; fall back to mark price if missing
+                raw = ticker.get("price") or ticker.get("markPrice") or ticker.get("lastPrice")
+                if not raw:
+                    mp = self.binance.futures_mark_price(symbol=pair)
+                    raw = mp.get("markPrice") or mp.get("indexPrice")
+            else:
+                ticker = self.binance.get_symbol_ticker(symbol=pair)
+                raw = ticker.get("price") or ticker.get("lastPrice")
+            return float(raw)
 
         try:
             price = _fetch()
@@ -211,7 +234,10 @@ class DataCollector:
         Returns None when data is unavailable (distinct from 0.0 = balanced).
         """
         try:
-            book = self.binance.get_order_book(symbol=pair, limit=C.ORDER_BOOK_DEPTH)
+            if config.TRADE_MODE == "futures":
+                book = self.binance.futures_order_book(symbol=pair, limit=C.ORDER_BOOK_DEPTH)
+            else:
+                book = self.binance.get_order_book(symbol=pair, limit=C.ORDER_BOOK_DEPTH)
             bid_vol = sum(float(b[1]) for b in book["bids"])
             ask_vol = sum(float(a[1]) for a in book["asks"])
             total = bid_vol + ask_vol
@@ -243,7 +269,10 @@ class DataCollector:
     def get_24h_stats(self, pair: str) -> dict:
         """24h high, low, volume, and price change % from Binance ticker."""
         try:
-            t = self.binance.get_ticker(symbol=pair)
+            if config.TRADE_MODE == "futures":
+                t = self.binance.futures_ticker(symbol=pair)
+            else:
+                t = self.binance.get_ticker(symbol=pair)
             return {
                 "high_24h":              float(t["highPrice"]),
                 "low_24h":               float(t["lowPrice"]),
@@ -620,6 +649,8 @@ class DataCollector:
             "fear_greed":           fng,
             "stats_24h":            stats_24h,
         }
+
+        snapshot = _sanitize(snapshot)
 
         logger.info(
             f"[{pair}] Collected | Price={price} | RSI={indicators_1h.get('rsi')} "

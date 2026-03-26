@@ -302,7 +302,11 @@ class FeedbackLoop:
                             pass
                         if not exit_price:
                             ticker = self.binance.futures_symbol_ticker(symbol=pair)
-                            exit_price = float(ticker["price"])
+                            raw = ticker.get("price") or ticker.get("markPrice") or ticker.get("lastPrice")
+                            if not raw:
+                                mp = self.binance.futures_mark_price(symbol=pair)
+                                raw = mp.get("markPrice") or mp.get("indexPrice")
+                            exit_price = float(raw)
                         self._close_confirmed_trade(trade, exit_price)
                         stale_found += 1
             except Exception as e:

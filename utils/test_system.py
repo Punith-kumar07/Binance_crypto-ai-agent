@@ -136,7 +136,10 @@ try:
     ok(f"Price fetch ({TEST_PAIR})", f"${price:,.2f}")
 
     # Order book
-    book = _bc.get_order_book(symbol=TEST_PAIR, limit=5)
+    if config.TRADE_MODE == "futures":
+        book = _bc.futures_order_book(symbol=TEST_PAIR, limit=5)
+    else:
+        book = _bc.get_order_book(symbol=TEST_PAIR, limit=5)
     best_bid = float(book["bids"][0][0])
     best_ask = float(book["asks"][0][0])
     spread_pct = (best_ask - best_bid) / best_bid * 100
@@ -255,6 +258,55 @@ try:
 except Exception as e:
     fail("DataCollector", traceback.format_exc().splitlines()[-1])
     snapshot = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. SYMBOL ENDPOINT VALIDATION — price fetch for all configured pairs
+# ═══════════════════════════════════════════════════════════════════════════
+section("3b · Symbol Endpoint Validation — all configured pairs")
+
+try:
+    from binance.client import Client as _BinanceClient
+    _bv = _BinanceClient(
+        config.BINANCE_API_KEY,
+        config.BINANCE_SECRET_KEY,
+        requests_params={"timeout": 10},
+    )
+    if config.BINANCE_TESTNET:
+        _bv.API_URL = "https://testnet.binance.vision/api"
+
+    _ep_ok: list = []
+    _ep_fail: list = []
+
+    for _sym in config.TRADING_PAIRS:
+        try:
+            if config.TRADE_MODE == "futures":
+                _t = _bv.futures_symbol_ticker(symbol=_sym)
+            else:
+                _t = _bv.get_symbol_ticker(symbol=_sym)
+            raw = _t.get("price") or _t.get("markPrice") or _t.get("lastPrice")
+            if not raw:
+                raise KeyError(f"no price key in response: {list(_t.keys())}")
+            float(raw)   # ensure value is numeric
+            _ep_ok.append(_sym)
+        except Exception as _e:
+            _ep_fail.append(f"{_sym} ({_e})")
+
+    if _ep_fail:
+        fail(
+            "Endpoint validation",
+            f"{len(_ep_fail)}/{len(config.TRADING_PAIRS)} pairs failed price fetch:\n" +
+            "\n".join(f"         • {e}" for e in _ep_fail)
+        )
+    else:
+        ok(
+            "Endpoint validation",
+            f"All {len(_ep_ok)} pairs return valid prices via "
+            f"{'futures' if config.TRADE_MODE == 'futures' else 'spot'} API"
+        )
+
+except Exception as _e:
+    fail("Endpoint validation", traceback.format_exc().splitlines()[-1])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -506,9 +558,47 @@ else:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 9. REAL-MONEY SAFETY CHECKLIST
+# 9. AI PROVIDERS — Groq status + Gemini fallback init
 # ═══════════════════════════════════════════════════════════════════════════
-section("9 · Real-Money Safety Checklist")
+section("9 · AI Providers — Groq + Gemini fallback")
+
+try:
+    from agents.brain import GroqKeyManager, AllKeysExhaustedError
+    km = GroqKeyManager(config.GROQ_API_KEYS)
+    avail = km.available_keys()
+    total = len(config.GROQ_API_KEYS)
+
+    if len(avail) == total:
+        ok("Groq keys", f"{len(avail)}/{total} available")
+    elif len(avail) > 0:
+        warn("Groq keys", f"only {len(avail)}/{total} available — {total - len(avail)} rate-limited")
+    else:
+        wait = km.earliest_reset_seconds()
+        warn("Groq keys", f"ALL {total} keys exhausted — first reset in {wait:.0f}s (~{wait/60:.1f}min). Gemini fallback will be used.")
+except Exception as e:
+    fail("Groq key manager", traceback.format_exc().splitlines()[-1])
+
+if not config.GEMINI_API_KEY:
+    warn("Gemini fallback", "GEMINI_API_KEY not set — no fallback when Groq runs dry")
+else:
+    try:
+        from google import genai as _genai
+        _gc = _genai.Client(api_key=config.GEMINI_API_KEY)
+        # list models — lightweight call that validates the key
+        available = [m.name for m in _gc.models.list()]
+        target = f"models/{config.GEMINI_MODEL}"
+        if any(config.GEMINI_MODEL in m for m in available):
+            ok("Gemini fallback", f"key valid | model '{config.GEMINI_MODEL}' available")
+        else:
+            warn("Gemini model", f"'{config.GEMINI_MODEL}' not in available models: {available[:5]}")
+    except Exception as e:
+        fail("Gemini fallback", traceback.format_exc().splitlines()[-1])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. REAL-MONEY SAFETY CHECKLIST
+# ═══════════════════════════════════════════════════════════════════════════
+section("10 · Real-Money Safety Checklist")
 
 checks = {
     "DRY_RUN should be false for live trading":
@@ -525,6 +615,8 @@ checks = {
         (config.STOP_LOSS_PCT > 0, "ok" if config.STOP_LOSS_PCT > 0 else "STOP LOSS IS ZERO!"),
     "GROQ_API_KEYS has at least 1 key":
         (len(config.GROQ_API_KEYS) >= 1, f"{len(config.GROQ_API_KEYS)} key(s)"),
+    "GEMINI_API_KEY set (fallback when Groq exhausted)":
+        (bool(config.GEMINI_API_KEY), "configured ✓" if config.GEMINI_API_KEY else "not set — agent pauses when Groq hits daily limit"),
     "SUPABASE configured":
         (bool(config.SUPABASE_URL and config.SUPABASE_KEY), "ok"),
 }

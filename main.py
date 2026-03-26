@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 import config
 from data.collector import DataCollector
-from agents.brain import TradingBrain
+from agents.brain import TradingBrain, AllKeysExhaustedError
 from agents.feedback import FeedbackLoop
 from agents.pair_selector import PairSelector
 from risk.manager import RiskManager
@@ -78,15 +78,19 @@ def run_cycle(pairs: list = None):
     except Exception as e:
         logger.error(f"Feedback loop error: {e}")
 
-    # ── Balance + slot calculation (─────────────────────────────────────────────
+    # ── Balance + slot calculation ──────────────────────────────────────────────
     balance = collector.get_usdt_balance()
-    max_slots = int(balance / config.MIN_ORDER_USDT)
 
     # Single DB query for ALL open trades (replaces N per-pair queries)
     all_open = db.get_all_open_trades()
     open_count = len(all_open)
     open_pairs = set(t["pair"] for t in all_open)
-    remaining_slots = max(0, max_slots - open_count)
+
+    # remaining_slots = how many more MIN_ORDER trades the free balance can fund.
+    # balance is already the available margin (Binance deducts open position margin).
+    # Do NOT subtract open_count — that double-counts already-deducted margin.
+    remaining_slots = int(balance / config.MIN_ORDER_USDT)
+    max_slots = open_count + remaining_slots   # for display only
 
     logger.info(
         f"💰 Balance: ${balance:.4f} | Slots: {max_slots} total / "
@@ -121,11 +125,31 @@ def run_cycle(pairs: list = None):
 
     logger.info(f"🔍 Scanning {len(candidates)} pair(s): {candidates}")
 
-    # ── Steps 1-6: Collect + AI analyse all candidates ───────────────────────────
+    # ── Guard: skip scan when ALL AI providers are unavailable ───────────────
+    if brain.all_providers_exhausted():
+        wait = brain._key_mgr.earliest_reset_seconds()
+        logger.warning(
+            f"⏸ ALL AI PROVIDERS EXHAUSTED (Groq+OpenRouter+Gemini) — "
+            f"skipping scan. Groq resets in {wait:.0f}s (~{wait/60:.1f}min)"
+        )
+        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
+        return
+
+    # ── Steps 1-9: Scan + AI analyse + Execute immediately per pair ──────────────
+    # Execute as soon as a pair hits MIN_CONFIDENCE — don't wait for all pairs.
+    # This prevents stale prices when using slow AI providers (browser AI ~60-90s/call).
     results       = []
     scan_outcomes = {}   # pair → {direction, confidence, in_selected, executed, error}
+    executed_set  = set()
+    selected_set  = set()
 
     for pair in candidates:
+        # Stop scanning once all slots are filled
+        if remaining_slots <= 0:
+            logger.info(f"⏭ All slots filled — skipping remaining pairs")
+            break
+
         try:
             logger.info(f"\n[{pair}] ── Step 1-2: Scanning market...")
             snapshot = collector.collect_all(pair)
@@ -160,6 +184,63 @@ def run_cycle(pairs: list = None):
                 "direction": direction, "confidence": confidence,
                 "in_selected": False, "executed": False, "error": False,
             }
+
+            # ── Steps 7-9: Execute immediately if actionable ──────────────────
+            # Price is still fresh — no need to wait for other pairs to finish.
+            if direction in ("BUY", "SELL") and confidence >= config.MIN_CONFIDENCE:
+                selected_set.add(pair)
+                scan_outcomes[pair]["in_selected"] = True
+
+                try:
+                    logger.info(f"[{pair}] ── Step 7-8: Risk evaluation...")
+                    order = risk.evaluate(direction, confidence, snapshot, reasoning)
+
+                    if order is None:
+                        logger.info(f"[{pair}] 🚫 Risk gate rejected.")
+                    else:
+                        logger.info(f"[{pair}] ── Step 9: Executing trade (price fresh)...")
+                        trade_result = executor.execute(order)
+                        executed_set.add(pair)
+                        remaining_slots -= 1
+                        scan_outcomes[pair]["executed"] = True
+
+                        logger.info(
+                            f"[{pair}] 🎯 Trade logged: {order.side} ${order.usdt_amount:.4f} USDT "
+                            f"| OrderID={trade_result.get('binance_order_id')}"
+                        )
+
+                        # Symbol suspended (-4140) — apply 24h cooldown
+                        if trade_result.get("_symbol_suspended"):
+                            from datetime import timedelta
+                            cd_until = datetime.now(timezone.utc) + timedelta(hours=24)
+                            selector._state.setdefault(pair, {})["cooldown_until"] = cd_until.isoformat()
+                            selector._save()
+                            logger.warning(f"[{pair}] 🔒 Suspended symbol — skipping for 24h until {cd_until.strftime('%H:%M UTC')}")
+
+                        tg.notify_trade_open(
+                            pair=pair,
+                            side=order.side,
+                            entry=order.entry_price,
+                            sl=order.stop_loss_price,
+                            tp=order.take_profit_price,
+                            usdt_amount=order.usdt_amount,
+                            confidence=confidence,
+                            is_dry=config.DRY_RUN,
+                        )
+                except Exception as e:
+                    logger.error(f"[{pair}] Execution failed: {e}", exc_info=True)
+            else:
+                tag = "HOLD" if direction == "HOLD" else f"LOW CONF ({confidence:.0f}% < {config.MIN_CONFIDENCE:.0f}%)"
+                logger.info(f"[{pair}] ⏩ Skipping — {tag}")
+
+        except AllKeysExhaustedError as e:
+            wait = brain._key_mgr.earliest_reset_seconds()
+            logger.warning(
+                f"[{pair}] ⏸ All Groq keys exhausted mid-scan — "
+                f"skipping remaining pairs. First reset in {wait:.0f}s (~{wait/60:.1f}min)"
+            )
+            scan_outcomes[pair] = {"direction": "HOLD", "confidence": 0, "error": True}
+            break  # no point scanning remaining pairs
         except Exception as e:
             logger.error(f"[{pair}] Scan failed: {e}", exc_info=True)
             scan_outcomes[pair] = {"direction": "HOLD", "confidence": 0, "error": True}
@@ -172,25 +253,19 @@ def run_cycle(pairs: list = None):
         logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
         return
 
-    # ── Rank: filter actionable, sort by confidence DESC ──────────────────
-    actionable = [
-        r for r in results
-        if r["direction"] in ("BUY", "SELL") and r["confidence"] >= config.MIN_CONFIDENCE
-    ]
-    actionable.sort(key=lambda x: x["confidence"], reverse=True)
-    selected   = actionable[:remaining_slots]
-    selected_set = {r["pair"] for r in selected}
-
-    # ── Print ranking table ────────────────────────────────────────────
+    # ── Print cycle summary table ──────────────────────────────────────────
     logger.info(f"\n{'─'*60}")
     logger.info(
-        f"📊 PAIR RANKING  ({len(results)} scanned | "
-        f"{len(actionable)} actionable | {len(selected)} selected)"
+        f"📊 CYCLE SUMMARY  ({len(results)} scanned | "
+        f"{len(selected_set)} actionable | {len(executed_set)} executed)"
     )
     logger.info(f"{'─'*60}")
     for r in results:
-        if r["pair"] in selected_set:
-            tag = "✅ SELECTED"
+        pair = r["pair"]
+        if pair in executed_set:
+            tag = "✅ EXECUTED"
+        elif pair in selected_set:
+            tag = "🚫 RISK REJECTED"
         elif r["direction"] == "HOLD":
             tag = "⏩ HOLD  (20min cooldown)"
         elif r["confidence"] < config.MIN_CONFIDENCE:
@@ -202,53 +277,6 @@ def run_cycle(pairs: list = None):
             f"  ~{r['horizon']}min  {tag}"
         )
     logger.info(f"{'─'*60}\n")
-
-    if not selected:
-        logger.info("🚫 No pairs met confidence threshold. No trades this cycle.")
-        if not override_pairs:
-            _record_all_outcomes(scan_outcomes, selected_set, executed_set=set())
-        elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
-        logger.info(f"✅ CYCLE DONE in {elapsed:.1f}s | Next in {config.CYCLE_INTERVAL}s")
-        return
-
-    # ── Steps 7-9: Risk check + Execute for each selected pair ────────────
-    executed_set = set()
-    for r in selected:
-        pair      = r["pair"]
-        snapshot  = r["snapshot"]
-        reasoning = r["reasoning"]
-        direction = r["direction"]
-        confidence = r["confidence"]
-
-        try:
-            logger.info(f"\n[{pair}] ── Step 7-8: Risk evaluation...")
-            order = risk.evaluate(direction, confidence, snapshot, reasoning)
-
-            if order is None:
-                logger.info(f"[{pair}] 🚫 Risk gate rejected.")
-                continue
-
-            logger.info(f"[{pair}] ── Step 9: Executing trade...")
-            trade_result = executor.execute(order)
-            executed_set.add(pair)
-
-            logger.info(
-                f"[{pair}] 🎯 Trade logged: {order.side} ${order.usdt_amount:.4f} USDT "
-                f"| OrderID={trade_result.get('binance_order_id')}"
-            )
-
-            tg.notify_trade_open(
-                pair=pair,
-                side=order.side,
-                entry=order.entry_price,
-                sl=order.stop_loss_price,
-                tp=order.take_profit_price,
-                usdt_amount=order.usdt_amount,
-                confidence=confidence,
-                is_dry=config.DRY_RUN,
-            )
-        except Exception as e:
-            logger.error(f"[{pair}] Execution failed: {e}", exc_info=True)
 
     # ── Record outcomes → apply cooldowns to all scanned pairs ─────────────────
     if not override_pairs:   # skip when using --pair (manual test)
@@ -344,8 +372,20 @@ def main():
     logger.info(f"⏰ Scheduled to run every {config.CYCLE_INTERVAL}s. Press Ctrl+C to stop.")
     try:
         while True:
-            schedule.run_pending()
-            time.sleep(5)
+            if brain.all_providers_exhausted():
+                # All AI providers unavailable — sleep until first Groq key resets
+                wait = brain._key_mgr.earliest_reset_seconds()
+                logger.info(
+                    f"💤 All AI providers exhausted (Groq+OpenRouter+Gemini) — "
+                    f"sleeping {wait:.0f}s (~{wait/60:.1f}min) until first Groq key resets..."
+                )
+                time.sleep(max(wait + 10, 60))  # +10s buffer; min 60s so we don't spam
+                # Clear stale schedule entries to avoid a burst of back-to-back cycles
+                schedule.clear()
+                schedule.every(config.CYCLE_INTERVAL).seconds.do(run_cycle, pairs=override)
+            else:
+                schedule.run_pending()
+                time.sleep(5)
     except KeyboardInterrupt:
         logger.info("👋 Agent stopped by user.")
 
