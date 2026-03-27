@@ -34,6 +34,17 @@ BINANCE_FEE_BUFFER_USDT = 0.50  # Extra reserve kept free for fees
 # ATR% above this threshold is considered high volatility → halve position
 HIGH_VOLATILITY_ATR_PCT = 3.0
 
+# ATR-based SL/TP multipliers (replaces fixed STOP_LOSS_PCT / TAKE_PROFIT_PCT)
+# SL = ATR × 1.5  →  wide enough to survive noise
+# TP = ATR × 3.5  →  R:R ≈ 2.3:1 — mathematically profitable above ~32% win rate
+ATR_SL_MULTIPLIER  = 1.5
+ATR_TP_MULTIPLIER  = 3.5
+ATR_MIN_RR_RATIO   = 2.0   # Enforce minimum 2:1 R:R (TP adjusted up if needed)
+
+# Minimum 24h quote volume (USDT) for a pair to be tradeable
+# Pairs below this have wide spreads, poor fills, and unreliable signals
+MIN_QUOTE_VOLUME_24H = 30_000_000   # $30M minimum
+
 # Confidence scaling: at MIN_CONFIDENCE → 50% of max size; at 100% → 100% of max
 CONFIDENCE_SIZE_FLOOR = 0.5
 

@@ -23,8 +23,12 @@ If token/chat_id are blank the module silently does nothing.
 """
 import threading
 import time
+import subprocess
+import os
+import signal
 import requests
 from datetime import datetime, timezone
+from collections import deque
 from loguru import logger
 import config
 
@@ -39,6 +43,153 @@ _bc = None              # cached Binance client
 
 _paused      = False
 _paused_lock = threading.Lock()
+
+# ── Agent subprocess management ──────────────────────────────────────────
+_agent_proc: subprocess.Popen | None = None
+_agent_lock = threading.Lock()
+_agent_log  = deque(maxlen=50)          # last 50 lines of agent stdout/stderr
+_log_thread: threading.Thread | None = None
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ── Agent subprocess helpers ─────────────────────────────────────────────────
+
+def _is_agent_running() -> bool:
+    with _agent_lock:
+        return _agent_proc is not None and _agent_proc.poll() is None
+
+
+def _agent_log_reader(proc: subprocess.Popen):
+    """Background thread that reads agent stdout/stderr into _agent_log, prints to terminal, and detects crashes."""
+    import sys as _sys
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if line:
+                stripped = line.rstrip()
+                _agent_log.append(stripped)
+                print(stripped, file=_sys.stdout, flush=True)
+    except Exception:
+        pass
+    # Stream ended — check if process crashed
+    if proc.poll() is not None and proc.returncode != 0:
+        _send(
+            f"🚨 <b>Agent CRASHED</b>\n"
+            f"Exit code: <code>{proc.returncode}</code>\n\n"
+            f"Last log lines:\n{_get_recent_logs(5)}\n\n"
+            f"Send /run to restart or /logs for more details."
+        )
+    elif proc.poll() is not None and proc.returncode == 0:
+        _send("ℹ️ <b>Agent stopped</b> (exit code 0).")
+
+
+def _start_agent() -> str:
+    """Launch main.py as a subprocess. Returns status message."""
+    global _agent_proc, _log_thread
+    with _agent_lock:
+        if _agent_proc is not None and _agent_proc.poll() is None:
+            return "⚠️ Agent is already running (PID {}).".format(_agent_proc.pid)
+        import sys
+        _agent_log.clear()
+        _agent_proc = subprocess.Popen(
+            [sys.executable, os.path.join(_PROJECT_DIR, "main.py")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=_PROJECT_DIR,
+        )
+        _log_thread = threading.Thread(
+            target=_agent_log_reader, args=(_agent_proc,),
+            daemon=True, name="agent-log-reader",
+        )
+        _log_thread.start()
+        return "✅ Agent started (PID {}).".format(_agent_proc.pid)
+
+
+def _stop_agent() -> str:
+    """Terminate the running agent subprocess. Returns status message."""
+    global _agent_proc
+    with _agent_lock:
+        if _agent_proc is None or _agent_proc.poll() is not None:
+            _agent_proc = None
+            return "⚠️ Agent is not running."
+        pid = _agent_proc.pid
+        _agent_proc.terminate()
+        try:
+            _agent_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _agent_proc.kill()
+            _agent_proc.wait(timeout=5)
+        _agent_proc = None
+        return "🛑 Agent terminated (PID {}).".format(pid)
+
+
+def _restart_agent() -> str:
+    """Terminate (if running) then start the agent. Returns status message."""
+    stop_msg = ""
+    if _is_agent_running():
+        stop_msg = _stop_agent() + "\n"
+    start_msg = _start_agent()
+    return stop_msg + "🔄 " + start_msg
+
+
+def _build_positions_text() -> tuple[str, dict | None]:
+    """Build a lightweight positions-only message with close buttons.
+    Returns (html_text, reply_markup_dict_or_None)."""
+    lev = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+    close_buttons = []
+    lines = ["📂 <b>Open Positions</b>", ""]
+
+    try:
+        c = _binance()
+        if config.TRADE_MODE == "futures":
+            all_pos = [p for p in c.futures_position_information()
+                       if float(p.get("positionAmt", 0)) != 0]
+        else:
+            all_pos = []
+
+        if all_pos:
+            for p in all_pos:
+                sym       = p["symbol"]
+                amt       = float(p["positionAmt"])
+                entry     = float(p["entryPrice"])
+                mark      = float(p["markPrice"])
+                upnl      = float(p["unRealizedProfit"])
+                dir_label = "LONG" if amt > 0 else "SHORT"
+                pnl_pct   = (mark - entry) / entry * 100 * lev if amt > 0 \
+                             else (entry - mark) / entry * 100 * lev
+                pnl_icon  = "🟢" if upnl >= 0 else "🔴"
+                lines.append(
+                    f"{pnl_icon} <b>{sym}</b>  {dir_label}  {lev}x\n"
+                    f"   Entry: <code>${entry:,.4f}</code>\n"
+                    f"   Mark:  <code>${mark:,.4f}</code>\n"
+                    f"   PnL:   <b>{pnl_pct:+.2f}%</b>  (<b>{upnl:+.3f} USDT</b>)"
+                )
+                lines.append("")
+                close_buttons.append(
+                    [{"text": f"🔴 Close {sym} ({pnl_pct:+.1f}%)", "callback_data": f"close:{sym}"}]
+                )
+        else:
+            lines.append("<i>No open positions.</i>")
+    except Exception as e:
+        lines.append(f"<i>Could not fetch positions: {e}</i>")
+
+    keyboard = {"inline_keyboard": close_buttons} if close_buttons else None
+    return "\n".join(lines), keyboard
+
+
+def _get_recent_logs(n: int = 20) -> str:
+    """Return the last N lines of agent output."""
+    lines = list(_agent_log)[-n:]
+    if not lines:
+        return "<i>No log output yet.</i>"
+    # Escape HTML entities and truncate long lines
+    escaped = []
+    for ln in lines:
+        ln = ln.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if len(ln) > 200:
+            ln = ln[:200] + "…"
+        escaped.append(ln)
+    return "<pre>" + "\n".join(escaped) + "</pre>"
 
 
 # ── Pause / resume (checked by main.py each cycle) ─────────────────────────
@@ -185,7 +336,9 @@ def _fetch_balance() -> float | None:
 
 # ── Status builder ──────────────────────────────────────────────────────────
 
-def _build_status_text() -> str:
+def _build_status_text() -> tuple[str, dict | None]:
+    """Build status message text and an inline keyboard with Close buttons.
+    Returns (html_text, reply_markup_dict_or_None)."""
     lev      = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
     mode     = config.TRADE_MODE.upper()
     dry_tag  = "🧪 DRY RUN" if config.DRY_RUN else "🔴 LIVE"
@@ -214,33 +367,52 @@ def _build_status_text() -> str:
 
     lines.append("")
 
-    # Open positions
-    if _monitors:
-        lines.append(f"📂 <b>Open positions ({len(_monitors)}):</b>")
-        for pair, m in _monitors.items():
-            price = _get_price(pair)
-            dir_label = "LONG" if m["side"] == "BUY" else "SHORT"
-            lev_n = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
-            if price:
-                pnl = (
-                    (price - m["entry"]) / m["entry"] * 100 * lev_n if m["side"] == "BUY"
-                    else (m["entry"] - price) / m["entry"] * 100 * lev_n
-                )
-                pnl_usdt = pnl / 100 * m["usdt_amount"]
-                pnl_icon = "🟢" if pnl >= 0 else "🔴"
+    # Open positions — pulled directly from Binance so restarts don't miss trades
+    close_buttons = []
+    try:
+        c = _binance()
+        if config.TRADE_MODE == "futures":
+            all_pos = [p for p in c.futures_position_information()
+                       if float(p.get("positionAmt", 0)) != 0]
+        else:
+            all_pos = []
+
+        if all_pos:
+            lines.append(f"📂 <b>Open positions ({len(all_pos)}):</b>")
+            for p in all_pos:
+                sym       = p["symbol"]
+                amt       = float(p["positionAmt"])
+                entry     = float(p["entryPrice"])
+                mark      = float(p["markPrice"])
+                upnl      = float(p["unRealizedProfit"])
+                dir_label = "LONG" if amt > 0 else "SHORT"
+                lev_n     = config.FUTURES_LEVERAGE if config.TRADE_MODE == "futures" else 1
+                pnl_pct   = (mark - entry) / entry * 100 * lev_n if amt > 0 \
+                             else (entry - mark) / entry * 100 * lev_n
+                pnl_icon  = "🟢" if upnl >= 0 else "🔴"
+                lines.append("")
                 lines.append(
-                    f"  {pnl_icon} <b>{pair}</b> {dir_label}  "
-                    f"<code>${price:,.4f}</code>  "
-                    f"PnL: <b>{pnl:+.2f}%</b> (<b>{pnl_usdt:+.3f} USDT</b>)"
+                    f"  {pnl_icon} <b>{sym}</b>  {dir_label}\n"
+                    f"     Entry: <code>${entry:,.4f}</code>\n"
+                    f"     Mark:  <code>${mark:,.4f}</code>\n"
+                    f"     PnL:   <b>{pnl_pct:+.2f}%</b>  (<b>{upnl:+.3f} USDT</b>)"
                 )
-            else:
-                lines.append(f"  ⚪ <b>{pair}</b> {dir_label}  entry <code>${m['entry']:,.4f}</code>")
-    else:
-        lines.append("📂 <b>No open positions</b>")
+                close_buttons.append(
+                    [{"text": f"🔴 Close {sym} ({pnl_pct:+.1f}%)", "callback_data": f"close:{sym}"}]
+                )
+        else:
+            lines.append("📂 <b>No open positions</b>")
+    except Exception as e:
+        lines.append(f"📂 <i>Could not fetch positions: {e}</i>")
 
     lines.append("")
-    lines.append("<i>Commands: /pause · /resume · /balance · /status</i>")
-    return "\n".join(lines)
+    agent_state = "🟢 RUNNING" if _is_agent_running() else "⚪ STOPPED"
+    lines.append(f"🤖 <b>Agent Process:</b>  {agent_state}")
+    lines.append("")
+    lines.append("<i>Commands: /run · /terminate · /logs · /pause · /resume · /balance · /status</i>")
+
+    keyboard = {"inline_keyboard": close_buttons} if close_buttons else None
+    return "\n".join(lines), keyboard
 
 
 # ── Position monitor (background thread per open trade) ─────────────────────
@@ -273,11 +445,13 @@ def _monitor_loop(pair: str, stop_event: threading.Event):
              reply_markup=_close_keyboard(pair))
 
 
-def stop_monitor(pair: str):
-    """Stop the live-update thread for a pair (called on trade close)."""
+def stop_monitor(pair: str) -> int | None:
+    """Stop the live-update thread for a pair. Returns message_id if available."""
     m = _monitors.pop(pair, None)
     if m:
         m["stop_event"].set()
+        return m.get("message_id")
+    return None
 
 
 # ── Callback & message poller ────────────────────────────────────────────────
@@ -310,7 +484,28 @@ def _handle_message(msg: dict):
     if chat_id != str(config.TELEGRAM_CHAT_ID):
         return
 
-    if text == "/pause":
+    if text == "/run":
+        result = _start_agent()
+        _send(f"🤖 {result}")
+    elif text == "/terminate":
+        result = _stop_agent()
+        _send(f"🤖 {result}")
+    elif text == "/restart":
+        result = _restart_agent()
+        _send(f"🤖 {result}")
+    elif text == "/positions":
+        pos_text, keyboard = _build_positions_text()
+        kwargs = dict(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=pos_text,
+            parse_mode="HTML",
+        )
+        if keyboard:
+            kwargs["reply_markup"] = keyboard
+        _api("sendMessage", **kwargs)
+    elif text == "/logs":
+        _send(f"📋 <b>Recent Agent Logs</b>\n\n{_get_recent_logs(20)}")
+    elif text == "/pause":
         _set_paused(True)
         _send("⏸ <b>Agent paused.</b> No new trades will be opened.\nSend /resume to restart.")
     elif text == "/resume":
@@ -323,15 +518,30 @@ def _handle_message(msg: dict):
         else:
             _send("❌ Could not fetch balance — check Binance API connection.")
     elif text == "/status":
-        _send(_build_status_text())
+        status_text, keyboard = _build_status_text()
+        kwargs = dict(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=status_text,
+            parse_mode="HTML",
+        )
+        if keyboard:
+            kwargs["reply_markup"] = keyboard
+        _api("sendMessage", **kwargs)
     elif text == "/help" or text == "/start":
         _send(
             "🤖 <b>Crypto AI Agent — Commands</b>\n\n"
-            "/status  — positions, balance, daily PnL\n"
-            "/balance — wallet balance\n"
-            "/pause   — stop opening new trades\n"
-            "/resume  — resume trading\n\n"
-            "<i>Use the inline Close button on trade alerts to close a position.</i>"
+            "<b>Agent Control:</b>\n"
+            "/run       — start the trading agent\n"
+            "/terminate — stop the trading agent\n"
+            "/restart   — terminate + start in one go\n"
+            "/logs      — show recent agent output\n\n"
+            "<b>Trading:</b>\n"
+            "/status    — full status + close buttons\n"
+            "/positions — open positions + close buttons\n"
+            "/balance   — wallet balance\n"
+            "/pause     — stop opening new trades\n"
+            "/resume    — resume trading\n\n"
+            "<i>Auto-alerts: You'll be notified if the agent crashes.</i>"
         )
 
 
@@ -350,6 +560,7 @@ def _handle_callback(cb: dict):
 def _close_via_telegram(pair: str):
     m      = _monitors.get(pair)
     is_dry = m.get("is_dry", False) if m else False
+    msg_id = m.get("message_id") if m else None
     try:
         if is_dry:
             from db import client as db_client
@@ -405,6 +616,11 @@ def _close_via_telegram(pair: str):
         _send(f"❌ Failed to close <b>{pair}</b>: <code>{e}</code>")
     finally:
         stop_monitor(pair)
+        if msg_id:
+            _api("editMessageReplyMarkup",
+                 chat_id=config.TELEGRAM_CHAT_ID,
+                 message_id=msg_id,
+                 reply_markup={"inline_keyboard": []})
 
 
 def start_polling():
@@ -486,7 +702,7 @@ def notify_trade_close(
     is_dry: bool,
     usdt_amount: float = 0.0,
 ):
-    stop_monitor(pair)   # kill the live-update thread
+    msg_id = stop_monitor(pair)   # kill live-update thread, get original message_id
 
     dir_label = "LONG" if side == "BUY" else "SHORT"
     if outcome == "win":
@@ -503,7 +719,7 @@ def notify_trade_close(
     if pnl_usdt is not None:
         pnl_line += f"  (<b>{pnl_usdt:+.3f} USDT</b>)"
 
-    _send(
+    close_text = (
         f"{icon} <b>{pair} {dir_label} CLOSED</b>{dry_tag}\n"
         f"{label}\n"
         f"Entry:  <code>${entry:,.4f}</code>\n"
@@ -511,12 +727,22 @@ def notify_trade_close(
         f"{pnl_line}"
     )
 
+    # Remove the Close button from the original open message
+    if msg_id:
+        _api("editMessageReplyMarkup",
+             chat_id=config.TELEGRAM_CHAT_ID,
+             message_id=msg_id,
+             reply_markup={"inline_keyboard": []})
 
-def notify_daily_limit_hit(daily_pnl: float):
-    """Alert when the daily loss limit is reached and the agent halts trading."""
+    _send(close_text)
+
+
+def notify_daily_limit_hit(pair: str, daily_pnl: float):
+    """Alert when a pair's daily loss limit is reached. Fires once per pair per day."""
     _send(
-        f"🚨 <b>Daily Loss Limit Hit</b>\n"
+        f"🚨 <b>Daily Loss Limit Hit — {pair}</b>\n"
         f"Daily PnL: <b>{daily_pnl:+.2f}%</b>  (limit: {config.MAX_DAILY_LOSS_PCT}%)\n"
-        f"Agent will <b>not open new trades</b> until tomorrow.\n\n"
-        f"<i>Use /status to monitor. Agent resumes automatically at midnight UTC.</i>"
+        f"<b>{pair}</b> will not open new trades until tomorrow.\n"
+        f"<i>Other pairs continue trading normally.</i>\n\n"
+        f"<i>Agent resumes {pair} automatically at midnight UTC.</i>"
     )

@@ -28,8 +28,10 @@ NOTES:
 import asyncio
 import json
 import re
+import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Allow running as:  python agents/browser_ai.py  (from project root)
@@ -41,6 +43,53 @@ from loguru import logger
 import config
 
 USER_DATA_DIR = Path("browser_session")
+
+# ── Chrome performance flags ──────────────────────────────────────────────────
+# Base flags used for both headed (login) and headless (agent) modes.
+_CHROME_ARGS_BASE = [
+    "--no-sandbox",                                  # required on Linux/Docker
+    "--disable-blink-features=AutomationControlled", # hide automation signal so Google doesn't restrict session
+    "--disable-dev-shm-usage",                       # prevent crashes on limited shared memory (Linux)
+]
+# Headless-only: disable GPU rendering pipeline (no display available)
+_CHROME_ARGS_HEADLESS = _CHROME_ARGS_BASE + ["--disable-gpu"]
+
+# ── Cache directories to clean periodically ───────────────────────────────────
+# IMPORTANT: Only clean GPU/shader caches — NOT the HTTP cache (Default/Cache)
+# or Code Cache. Those contain Gemini's JS bundles. Deleting them forces Chrome
+# to re-download 5-10MB of JS every cycle, causing 15-30s load delays.
+_CACHE_DIRS = [
+    USER_DATA_DIR / "Default" / "GPUCache",
+    USER_DATA_DIR / "Default" / "DawnWebGPUCache",
+    USER_DATA_DIR / "Default" / "DawnGraphiteCache",
+    USER_DATA_DIR / "ShaderCache",
+    USER_DATA_DIR / "GrShaderCache",
+    USER_DATA_DIR / "GraphiteDawnCache",
+]
+_CACHE_CLEAN_INTERVAL = 45 * 60   # 45 minutes
+
+
+def _clean_browser_cache():
+    """Delete Chrome cache dirs. Chrome recreates them on demand."""
+    cleaned, freed = 0, 0
+    for d in _CACHE_DIRS:
+        if d.exists():
+            try:
+                freed += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                shutil.rmtree(d)
+                cleaned += 1
+            except Exception as e:
+                logger.debug(f"[BrowserAI] Cache clean skip {d.name}: {e}")
+    if cleaned:
+        logger.info(f"[BrowserAI] Cache cleaned — {cleaned} dirs, {freed / 1024 / 1024:.1f} MB freed")
+
+
+def _cache_cleaner_loop():
+    """Background thread: clean cache every 45 minutes."""
+    while True:
+        time.sleep(_CACHE_CLEAN_INTERVAL)
+        _clean_browser_cache()
+
 
 # ── Selectors (fallback lists — most reliable first) ─────────────────────────
 _CHATGPT_INPUT_SELECTORS = [
@@ -129,21 +178,16 @@ def _extract_json(text: str) -> dict:
 async def _ask_chatgpt(page, message: str, attempt: int = 0) -> str:
     """
     Send a message on ChatGPT and return the full text response.
-    Opens a new chat each time to avoid context contamination.
+    The page is pre-warmed (already on chatgpt.com) — no navigation at start.
+    We navigate back to a fresh chat at the END so the next call is instant.
     """
-    logger.info(f"[BrowserAI/ChatGPT] Opening new conversation (attempt {attempt + 1})...")
+    logger.info(f"[BrowserAI/ChatGPT] Sending prompt (attempt {attempt + 1})...")
 
-    # Navigate to a fresh chat
-    await page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(2500)
-
-    # Try clicking "New chat" button if we landed on an existing conversation
-    try:
-        new_chat = await _find_element(page, _CHATGPT_NEW_CHAT_SELECTORS, timeout_ms=3000)
-        await new_chat.click()
+    # Only navigate if not already on ChatGPT (error recovery)
+    if "chatgpt.com" not in page.url:
+        logger.debug(f"[BrowserAI/ChatGPT] Not on ChatGPT — navigating now")
+        await page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=60_000)
         await page.wait_for_timeout(1500)
-    except Exception:
-        pass  # Already on a blank new chat
 
     # Type message
     logger.debug(f"[BrowserAI/ChatGPT] Typing prompt ({len(message)} chars)...")
@@ -169,15 +213,23 @@ async def _ask_chatgpt(page, message: str, attempt: int = 0) -> str:
     await page.wait_for_timeout(800)
 
     # Extract last assistant message
+    result = None
     for sel in _CHATGPT_RESPONSE_SELECTORS:
         try:
             msgs = await page.locator(sel).all()
             if msgs:
-                return (await msgs[-1].inner_text()).strip()
+                result = (await msgs[-1].inner_text()).strip()
+                break
         except Exception:
             continue
 
-    raise RuntimeError("Could not extract ChatGPT response")
+    if result is None:
+        raise RuntimeError("Could not extract ChatGPT response")
+
+    # Pre-warm: navigate to fresh chat so next call is instant
+    await page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=60_000)
+    logger.debug("[BrowserAI/ChatGPT] Page reset — ready for next call")
+    return result
 
 
 # ─── Gemini ──────────────────────────────────────────────────────────────────
@@ -186,15 +238,21 @@ async def _ask_gemini(page, message: str, attempt: int = 0) -> str:
     """Send a message on Gemini and return the full text response."""
     logger.info(f"[BrowserAI/Gemini] Opening new conversation (attempt {attempt + 1})...")
 
-    # Navigate to a fresh conversation
-    await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(1500)
+    # ── Step 1: Verify we're on a blank Gemini page ──────────────────────────
+    # The page is pre-warmed at init and reloaded at the END of each call,
+    # so we should already be on a fresh /app page — no navigation needed.
+    # Only navigate if something went wrong (crash, wrong URL, etc.).
+    current_url = page.url
+    if "gemini.google.com/app" not in current_url:
+        logger.debug(f"[BrowserAI/Gemini] Not on Gemini (url={current_url!r}) — navigating now")
+        await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60_000)
 
-    # Poll for the input via JS — handles Angular shadow DOM and slow hydration.
-    # wait_for_selector() doesn't pierce shadow roots; JS querySelector does.
+    # ── Step 2: Wait for input + paste prompt ────────────────────────────────
+    # Poll via JS — handles Angular shadow DOM and slow hydration.
+    # No fixed sleep — we wait for the element itself to be ready.
     logger.debug(f"[BrowserAI/Gemini] Waiting for input + pasting prompt ({len(message)} chars)...")
     pasted = False
-    for _ in range(20):   # max 20 × 2s = 40s
+    for _ in range(20):   # max 20 × 1s = 20s
         pasted = await page.evaluate(
             """(text) => {
                 const el = document.querySelector('div[role="textbox"]')
@@ -211,25 +269,23 @@ async def _ask_gemini(page, message: str, attempt: int = 0) -> str:
         )
         if pasted:
             break
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1000)   # 1s between checks (was 2s)
 
     if not pasted:
         raise RuntimeError("Gemini input never appeared — is the session still logged in?")
 
-    # Press Enter to send
+    # ── Step 3: Send ─────────────────────────────────────────────────────────
     await page.keyboard.press("Enter")
-    logger.info("[BrowserAI/Gemini] Prompt sent — waiting for URL change...")
+    logger.info("[BrowserAI/Gemini] Prompt sent — waiting for response...")
 
     # After sending, Gemini navigates from /app → /app/<conversation_id>
     try:
-        await page.wait_for_url(re.compile(r".*/app/.+"), timeout=15_000)
+        await page.wait_for_url(re.compile(r".*/app/.+"), timeout=10_000)
         logger.debug("[BrowserAI/Gemini] URL changed — conversation created")
     except Exception:
         pass  # some Gemini versions stay on /app — that's fine
 
-    logger.info("[BrowserAI/Gemini] Waiting for response element...")
-
-    # Try selectors in order — most reliable first for headless Chrome
+    # ── Step 4: Wait for response element ────────────────────────────────────
     found_sel = None
     for sel in _GEMINI_RESPONSE_SELECTORS:
         try:
@@ -247,14 +303,14 @@ async def _ask_gemini(page, message: str, attempt: int = 0) -> str:
             "Check that the session is still valid (run: python agents/browser_ai.py --login gemini)"
         )
 
-    # Poll for text content to stabilize — more reliable than spinner in headless mode.
-    # Streaming is done when the last element's text stops changing for 2 consecutive checks.
+    # ── Step 5: Poll for stable response text ────────────────────────────────
+    # Streaming is done when text stops changing for 2 consecutive 1s checks (= 2s stable).
     logger.info("[BrowserAI/Gemini] Polling for stable response text...")
     prev_text = ""
     stable_count = 0
     raw = ""
-    for _ in range(50):          # max 50 × 2s = 100s
-        await page.wait_for_timeout(2000)
+    for _ in range(100):         # max 100 × 1s = 100s
+        await page.wait_for_timeout(1000)   # 1s poll (was 2s)
         try:
             count = await page.locator(found_sel).count()
             if count == 0:
@@ -262,7 +318,7 @@ async def _ask_gemini(page, message: str, attempt: int = 0) -> str:
             candidate = (await page.locator(found_sel).last.inner_text()).strip()
             if candidate and candidate == prev_text:
                 stable_count += 1
-                if stable_count >= 2:   # text unchanged for 4s = streaming done
+                if stable_count >= 2:   # unchanged for 2s = streaming done
                     raw = candidate
                     break
             else:
@@ -271,7 +327,6 @@ async def _ask_gemini(page, message: str, attempt: int = 0) -> str:
         except Exception:
             continue
     else:
-        # Loop exhausted without stability — return whatever we accumulated
         raw = prev_text
         if not raw:
             raise RuntimeError("Gemini response never produced stable text after 100s")
@@ -279,6 +334,25 @@ async def _ask_gemini(page, message: str, attempt: int = 0) -> str:
     # Strip "Gemini said\n\n" accessibility prefix added for screen readers
     if raw.lower().startswith("gemini said"):
         raw = raw.split("\n", 2)[-1].strip()
+
+    # Detect Gemini error pages — raise so the caller retries
+    _ERROR_PHRASES = [
+        "something went wrong",
+        "couldn't process",
+        "an error occurred",
+        "try again",
+        "i'm not able to",
+        "unable to respond",
+    ]
+    if any(p in raw.lower() for p in _ERROR_PHRASES) and len(raw) < 400:
+        raise RuntimeError(f"Gemini returned an error page: {raw[:120]}")
+
+    # ── Step 6: Pre-warm for next call ───────────────────────────────────────
+    # Navigate back to /app NOW (while we process the result) so the next call
+    # finds a blank page ready to go — zero navigation wait on the next request.
+    await page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60_000)
+    logger.debug("[BrowserAI/Gemini] Page reset to /app — ready for next call")
+
     return raw
 
 
@@ -292,16 +366,20 @@ class BrowserAIAgent:
     Thread-safe: uses an asyncio event loop running in a background thread.
     """
 
+    # Minimum seconds between consecutive Gemini/ChatGPT calls — avoids rate limiting
+    _INTER_CALL_COOLDOWN = 15
+
     def __init__(self, headed: bool | None = None):
-        self._provider  = config.BROWSER_AI_PROVIDER.lower()   # "chatgpt" | "gemini" | "off"
+        self._provider   = config.BROWSER_AI_PROVIDER.lower()   # "chatgpt" | "gemini" | "off"
         # headed: CLI flag overrides .env; .env overrides default (False)
-        self._headed    = headed if headed is not None else config.BROWSER_AI_HEADED
-        self._loop      = None
-        self._context   = None
-        self._page      = None
+        self._headed     = headed if headed is not None else config.BROWSER_AI_HEADED
+        self._loop       = None
+        self._context    = None
+        self._page       = None
         self._playwright = None
-        self._lock      = threading.Lock()
-        self._ready     = False
+        self._lock       = threading.Lock()
+        self._ready      = False
+        self._last_call  = 0.0   # epoch time of last completed call
 
         if self._provider == "off":
             logger.info("[BrowserAI] Disabled (BROWSER_AI_PROVIDER=off)")
@@ -344,18 +422,16 @@ class BrowserAIAgent:
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
         USER_DATA_DIR.mkdir(exist_ok=True)
+        # Clean stale cache before launch so startup is faster
+        _clean_browser_cache()
         # channel="chrome" uses your real system Chrome — Google/OpenAI accept it.
         # Bundled Chromium gets "Couldn't sign you in / browser may not be secure".
+        chrome_args = _CHROME_ARGS_HEADLESS if not self._headed else _CHROME_ARGS_BASE
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(USER_DATA_DIR),
             channel="chrome",
             headless=not self._headed,
-            args=[
-                "--no-sandbox",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=chrome_args,
             viewport={"width": 1280, "height": 800},
             ignore_https_errors=True,
         )
@@ -364,8 +440,32 @@ class BrowserAIAgent:
             if self._context.pages
             else await self._context.new_page()
         )
+        # Patch navigator.webdriver = undefined on every page load.
+        # --disable-blink-features=AutomationControlled removes the Chrome flag,
+        # but JS code can still read navigator.webdriver = true. Google checks both.
+        await self._page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        # Pre-warm: navigate to Gemini/ChatGPT now so the first call has zero nav wait.
+        # Subsequent calls also skip navigation — we reload at the END of each call instead.
+        await self._prewarm_page()
         self._ready = True
         logger.info(f"[BrowserAI] Browser ready ({self._provider.upper()} mode)")
+        # Start periodic cache cleaner (runs every 45 min in background)
+        threading.Thread(
+            target=_cache_cleaner_loop, daemon=True, name="browser-cache-cleaner"
+        ).start()
+
+    async def _prewarm_page(self):
+        """Navigate to the provider's home so the page is ready for the next call."""
+        try:
+            if self._provider == "chatgpt":
+                await self._page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=60_000)
+            else:
+                await self._page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=60_000)
+            logger.debug(f"[BrowserAI] Page pre-warmed for next {self._provider.upper()} call")
+        except Exception as e:
+            logger.warning(f"[BrowserAI] Pre-warm navigation failed (non-fatal): {e}")
 
     def stop(self):
         """Gracefully shut down the browser."""
@@ -391,13 +491,41 @@ class BrowserAIAgent:
                     "reasoning": "Browser not ready", "_reasoning_id": None,
                     "error": "BROWSER_NOT_READY"}
 
+        # Enforce inter-call cooldown — avoid rate limiting / "something went wrong"
+        elapsed = time.time() - self._last_call
+        if elapsed < self._INTER_CALL_COOLDOWN:
+            wait = self._INTER_CALL_COOLDOWN - elapsed
+            logger.info(f"[{pair}] [BrowserAI] Cooldown: waiting {wait:.1f}s before next call")
+            time.sleep(wait)
+
+        # Trim prompt if too long — preserve HEAD (instructions) + TAIL (JSON schema),
+        # trim only the MIDDLE (raw market data numbers). This ensures Gemini always
+        # sees the format requirements and can return valid JSON.
+        MAX_PROMPT_CHARS = 7000
+        if len(message) > MAX_PROMPT_CHARS:
+            keep_head = 3000   # instructions + context
+            keep_tail = 2000   # JSON schema + output format
+            trimmed = len(message) - keep_head - keep_tail
+            logger.debug(
+                f"[{pair}] [BrowserAI] Trimming prompt {len(message)} → "
+                f"{keep_head + keep_tail} chars (removed {trimmed} chars of market data)"
+            )
+            message = (
+                message[:keep_head]
+                + f"\n\n[... {trimmed} chars of market data omitted for length ...]\n\n"
+                + message[-keep_tail:]
+            )
+
         with self._lock:   # one request at a time
             future = asyncio.run_coroutine_threadsafe(
                 self._ask_async(message, pair), self._loop
             )
             try:
-                return future.result(timeout=300)   # 5 min: 60s nav + 10s hydrate + 60s element + 100s poll + buffer
+                result = future.result(timeout=300)   # 5 min: 60s nav + 10s hydrate + 60s element + 100s poll + buffer
+                self._last_call = time.time()
+                return result
             except Exception as e:
+                self._last_call = time.time()   # still count failed calls against cooldown
                 logger.error(f"[{pair}] [BrowserAI] Request timed out or failed: {e}")
                 return {"direction": "HOLD", "confidence": 0,
                         "reasoning": str(e), "_reasoning_id": None,
@@ -448,6 +576,9 @@ class BrowserAIAgent:
             # Reinitialise page on navigation/crash errors
             try:
                 self._page = await self._context.new_page()
+                await self._page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                )
             except Exception:
                 pass
             return {"direction": "HOLD", "confidence": 0,
@@ -488,16 +619,12 @@ async def _login_flow(provider: str):
 
     async with async_playwright() as p:
         # Must use channel="chrome" — Google blocks sign-in from bundled Chromium
+        # Use base args only (no --disable-gpu) — headed login needs GPU rendering
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(USER_DATA_DIR),
             channel="chrome",
             headless=False,
-            args=[
-                "--no-sandbox",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=_CHROME_ARGS_BASE,
             viewport={"width": 1280, "height": 900},
             ignore_https_errors=True,
         )

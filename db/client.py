@@ -21,6 +21,19 @@ def get_client() -> Client:
     return _client
 
 
+def _reset_client():
+    """Force a fresh connection on next get_client() call."""
+    global _client
+    _client = None
+
+
+def _db_error(msg: str, e: Exception):
+    """Log DB error and reset client if the connection was dropped."""
+    logger.error(f"{msg}: {e}")
+    if "disconnect" in str(e).lower() or "server disconnected" in str(e).lower():
+        _reset_client()
+
+
 # ── Write helpers ──────────────────────────────────────────────────────────
 
 def log_signal_snapshot(pair: str, signals: dict, raw_data: dict):
@@ -33,7 +46,7 @@ def log_signal_snapshot(pair: str, signals: dict, raw_data: dict):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:
-        logger.error(f"DB signal_snapshot write failed: {e}")
+        _db_error("DB signal_snapshot write failed", e)
 
 
 def log_agent_reasoning(pair: str, context_sent: str, reasoning: dict) -> str | None:
@@ -58,7 +71,7 @@ def log_agent_reasoning(pair: str, context_sent: str, reasoning: dict) -> str | 
         if rows:
             return rows[0].get("id")
     except Exception as e:
-        logger.error(f"DB agent_reasoning write failed: {e}")
+        _db_error("DB agent_reasoning write failed", e)
     return None
 
 
@@ -70,7 +83,7 @@ def log_trade(trade: dict):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:
-        logger.error(f"DB trade_history write failed: {e}")
+        _db_error("DB trade_history write failed", e)
 
 
 def update_trade_outcome(trade_id: str, outcome: dict):
@@ -84,7 +97,7 @@ def update_trade_outcome(trade_id: str, outcome: dict):
             "prediction_correct": outcome.get("prediction_correct"),
         }).eq("id", trade_id).execute()
     except Exception as e:
-        logger.error(f"DB trade outcome update failed: {e}")
+        _db_error("DB trade outcome update failed", e)
 
 
 def update_reasoning_accuracy(reasoning_id: str, was_correct: bool):
@@ -95,7 +108,7 @@ def update_reasoning_accuracy(reasoning_id: str, was_correct: bool):
             .eq("id", reasoning_id) \
             .execute()
     except Exception as e:
-        logger.error(f"DB reasoning accuracy update failed: {e}")
+        _db_error("DB reasoning accuracy update failed", e)
 
 
 # ── Read helpers ───────────────────────────────────────────────────────────
@@ -111,7 +124,7 @@ def get_recent_reasoning(pair: str, limit: int = 5) -> list:
             .execute()
         return res.data or []
     except Exception as e:
-        logger.error(f"DB get_recent_reasoning failed: {e}")
+        _db_error("DB get_recent_reasoning failed", e)
         return []
 
 
@@ -125,7 +138,7 @@ def get_open_trades(pair: str) -> list:
             .execute()
         return res.data or []
     except Exception as e:
-        logger.error(f"DB get_open_trades failed: {e}")
+        _db_error("DB get_open_trades failed", e)
         return []
 
 
@@ -141,7 +154,7 @@ def get_all_open_trades() -> list:
             .execute()
         return res.data or []
     except Exception as e:
-        logger.error(f"DB get_all_open_trades failed: {e}")
+        _db_error("DB get_all_open_trades failed", e)
         return []
 
 
@@ -157,5 +170,5 @@ def get_daily_pnl_pct(pair: str) -> float:
             .execute()
         return sum(r["pnl_pct"] for r in (res.data or []))
     except Exception as e:
-        logger.error(f"DB get_daily_pnl failed: {e}")
+        _db_error("DB get_daily_pnl failed", e)
         return 0.0

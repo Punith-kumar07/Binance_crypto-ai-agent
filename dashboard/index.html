@@ -132,6 +132,11 @@
   let allRecentTrades = [];
   const TRADES_PER_PAGE = 10;
 
+  // Analytics "By Pair" pagination
+  let analyticsPairPage = 0;
+  const ANALYTICS_PAIR_PER_PAGE = 10;
+  let _cachedAnalytics = null;
+
   async function fetchStatus() {
     try {
       const r = await fetch('/api/status');
@@ -561,29 +566,34 @@
       return p >= 0 ? '#22c55e' : '#ef4444';
     }
 
-    function tableCard(title, icon, rows) {
-      const rowsHtml = rows.map(([label, stats]) => {
-        const wr  = stats.win_rate;
-        const bar = wr !== null
-          ? `<div style="width:${wr}%;height:3px;background:${winRateColor(wr)};border-radius:2px;margin-top:2px"></div>`
-          : '';
-        const wrStr  = wr !== null ? wr.toFixed(1) + '%' : '—';
-        const pnlStr = stats.avg_pnl !== null
-          ? (stats.avg_pnl >= 0 ? '+' : '') + stats.avg_pnl.toFixed(2) + '%'
-          : '—';
-        const totPnl = stats.total_pnl !== 0
-          ? (stats.total_pnl >= 0 ? '+' : '') + stats.total_pnl.toFixed(2) + '%'
-          : '—';
-        return `<tr style="border-top:1px solid #1e1e2e">
-          <td class="px-3 py-2.5 text-gray-300 font-medium text-xs">${label}</td>
-          <td class="px-3 py-2.5 text-right text-xs text-gray-500">${stats.wins}W&nbsp;/&nbsp;${stats.losses}L</td>
-          <td class="px-3 py-2.5 text-right text-xs font-bold" style="color:${winRateColor(wr)}">
-            ${wrStr}${bar}
-          </td>
-          <td class="px-3 py-2.5 text-right text-xs" style="color:${pnlColor(stats.avg_pnl)}">${pnlStr}</td>
-          <td class="px-3 py-2.5 text-right text-xs" style="color:${pnlColor(stats.total_pnl)}">${totPnl}</td>
-        </tr>`;
-      }).join('');
+    function buildRowHtml([label, stats]) {
+      const wr  = stats.win_rate;
+      const bar = wr !== null
+        ? `<div style="width:${wr}%;height:3px;background:${winRateColor(wr)};border-radius:2px;margin-top:2px"></div>`
+        : '';
+      const wrStr  = wr !== null ? wr.toFixed(1) + '%' : '—';
+      const pnlStr = stats.avg_pnl !== null
+        ? (stats.avg_pnl >= 0 ? '+' : '') + stats.avg_pnl.toFixed(2) + '%'
+        : '—';
+      const totPnl = stats.total_pnl !== 0
+        ? (stats.total_pnl >= 0 ? '+' : '') + stats.total_pnl.toFixed(2) + '%'
+        : '—';
+      return `<tr style="border-top:1px solid #1e1e2e">
+        <td class="px-3 py-2.5 text-gray-300 font-medium text-xs">${label}</td>
+        <td class="px-3 py-2.5 text-right text-xs text-gray-500">${stats.wins}W&nbsp;/&nbsp;${stats.losses}L</td>
+        <td class="px-3 py-2.5 text-right text-xs font-bold" style="color:${winRateColor(wr)}">
+          ${wrStr}${bar}
+        </td>
+        <td class="px-3 py-2.5 text-right text-xs" style="color:${pnlColor(stats.avg_pnl)}">${pnlStr}</td>
+        <td class="px-3 py-2.5 text-right text-xs" style="color:${pnlColor(stats.total_pnl)}">${totPnl}</td>
+      </tr>`;
+    }
+
+    function tableCard(title, icon, rows, paginationId) {
+      const rowsHtml = rows.map(r => buildRowHtml(r)).join('');
+      const paginHtml = paginationId
+        ? `<div id="${paginationId}" class="px-4 py-2 flex items-center justify-end gap-2 text-[10px] text-gray-500" style="background:#0f0f1a;border-top:1px solid #1e1e2e"></div>`
+        : '';
 
       return `<div class="card rounded-xl overflow-hidden">
         <div class="px-4 py-3" style="background:#16162a">
@@ -601,18 +611,49 @@
           </thead>
           <tbody>${rowsHtml}</tbody>
         </table>
+        ${paginHtml}
       </div>`;
     }
 
-    const pairRows      = Object.entries(d.by_pair || {});
+    _cachedAnalytics = d;
+    const allPairRows   = Object.entries(d.by_pair || {});
     const directionRows = Object.entries(d.by_direction || {});
     const regimeRows    = Object.entries(d.by_regime || {});
 
+    // Paginate "By Pair"
+    const totalPairPages = Math.ceil(allPairRows.length / ANALYTICS_PAIR_PER_PAGE);
+    if (analyticsPairPage >= totalPairPages) analyticsPairPage = Math.max(0, totalPairPages - 1);
+    const pStart = analyticsPairPage * ANALYTICS_PAIR_PER_PAGE;
+    const pagePairRows = allPairRows.slice(pStart, pStart + ANALYTICS_PAIR_PER_PAGE);
+
     el.innerHTML = [
-      tableCard('By Pair',      '📊', pairRows),
+      tableCard('By Pair',      '📊', pagePairRows, allPairRows.length > ANALYTICS_PAIR_PER_PAGE ? 'pair-pagination' : null),
       tableCard('By Direction', '🎯', directionRows),
       tableCard('By Regime',    '🌊', regimeRows),
     ].join('');
+
+    // Render pair pagination controls
+    if (allPairRows.length > ANALYTICS_PAIR_PER_PAGE) {
+      const paginEl = document.getElementById('pair-pagination');
+      if (paginEl) {
+        paginEl.innerHTML = `
+          <button onclick="changeAnalyticsPairPage(-1)" ${analyticsPairPage === 0 ? 'disabled' : ''}
+            class="px-2 py-0.5 rounded border border-gray-800 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent transition-colors">
+            Prev
+          </button>
+          <span class="mx-1">Page ${analyticsPairPage + 1} of ${totalPairPages}</span>
+          <button onclick="changeAnalyticsPairPage(1)" ${analyticsPairPage >= totalPairPages - 1 ? 'disabled' : ''}
+            class="px-2 py-0.5 rounded border border-gray-800 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent transition-colors">
+            Next
+          </button>
+        `;
+      }
+    }
+  }
+
+  function changeAnalyticsPairPage(delta) {
+    analyticsPairPage += delta;
+    if (_cachedAnalytics) renderAnalytics(_cachedAnalytics);
   }
 
   // ════════════════════════════════════════════════════════

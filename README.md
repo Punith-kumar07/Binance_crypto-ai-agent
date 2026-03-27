@@ -1,36 +1,35 @@
-# 🤖 Crypto AI Trading Agent
+# Crypto AI Trading Agent
 
-A fully autonomous AI-powered crypto trading agent using:
-- **Binance** — market data + order execution
-- **Groq** (llama-3.3-70b) — research brain / reasoning engine
+A fully autonomous AI-powered crypto futures trading agent.
+
+- **Binance Futures** — market data + order execution (LONG & SHORT)
+- **Groq** (llama-3.3-70b) — primary reasoning engine
+- **Browser AI** — fallback to Gemini or ChatGPT via Playwright (no API key needed)
 - **Supabase** — signal storage, trade history, feedback loop
-- **pandas-ta** — technical indicators
+- **Telegram** — real-time alerts + manual control
 
 ---
 
-## Architecture (10-Step Research Loop)
+## Architecture
 
 ```
-1. 🌍 Scan    → Binance OHLCV + order book
-2. 🧾 Gather  → News (CryptoPanic) + Fear&Greed + sentiment
-3. 🧠 Context → Build full market briefing
-4. 🔗 Correlate → AI checks signal alignment across timeframes
-5. 🧩 Hypothesis → AI forms directional view with reasoning
-6. 🎯 Confidence → AI assigns probability score
-7. ⚖️  Risk    → Gate: confidence > 65%, no open position, balance OK
-8. 🧠 Decision → BUY / SELL / HOLD
-9. ⚡ Execute  → Binance market order + OCO stop-loss/take-profit
-10. 🔁 Feedback → Outcome vs prediction → improves next cycle
+1. Scan      → Binance OHLCV + order book (15 liquid pairs)
+2. Gather    → Funding rate + open interest + Fear&Greed + news
+3. Indicators → RSI, MACD, Bollinger, EMA, ATR (1H + 4H)
+4. AI Brain  → Groq (primary) → Browser AI (fallback)
+5. Risk Gate → Confidence > threshold, funding rate check, liquidity check
+6. Execute   → Binance futures market order (LONG or SHORT)
+7. Monitor   → ATR-based dynamic SL/TP, Telegram live updates
+8. Feedback  → Outcome vs prediction → improves next cycle
 ```
 
 ---
 
 ## Setup
 
-### 1. Clone and install
+### 1. Install dependencies
 
 ```bash
-cd crypto_agent
 pip install -r requirements.txt
 ```
 
@@ -41,28 +40,28 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
-Required:
-- `BINANCE_API_KEY` + `BINANCE_SECRET_KEY` — from Binance → API Management
-- `GROQ_API_KEY` — from console.groq.com (free)
-- `SUPABASE_URL` + `SUPABASE_KEY` — from your Supabase project settings
+**Required:**
+- `BINANCE_API_KEY` + `BINANCE_SECRET_KEY` — Binance → API Management (Futures enabled)
+- `GROQ_API_KEY` — console.groq.com (free)
+- `SUPABASE_URL` + `SUPABASE_KEY` — Supabase project settings
+- `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` — @BotFather on Telegram
 
-Optional but recommended:
-- `CRYPTOPANIC_API_KEY` — free at cryptopanic.com (improves news quality)
+**Optional:**
+- `CRYPTOPANIC_API_KEY` — free at cryptopanic.com (better news)
 
-### 3. Set up Supabase database
+### 3. Set up Supabase
 
-1. Go to your Supabase project → SQL Editor
-2. Paste and run the contents of `db/setup.sql`
-3. This creates 3 tables: `signal_snapshots`, `agent_reasoning`, `trade_history`
+1. Supabase project → SQL Editor
+2. Paste and run `db/setup.sql`
+3. Creates: `signal_snapshots`, `agent_reasoning`, `trade_history`
 
 ### 4. Binance API permissions
 
-Your Binance API key needs:
 - ✅ Read Info
-- ✅ Enable Spot & Margin Trading
-- ❌ Do NOT enable withdrawals (never needed)
+- ✅ Enable Futures Trading
+- ❌ No withdrawals
 
-### 5. Test your config
+### 5. Test config
 
 ```bash
 python config.py
@@ -70,136 +69,189 @@ python config.py
 
 ---
 
-## Running the Agent
-
-### ⚠️ Always start in DRY RUN mode first
-
-In `.env`:
-```
-DRY_RUN=true
-```
+## Running
 
 ```bash
-# Single test cycle (recommended first run)
+# Dry run first (always)
+DRY_RUN=true python main.py
+
+# Single test cycle
 python main.py --once
 
-# Test a specific pair
-python main.py --pair BTCUSDT --once
+# Test specific pair
+python main.py --pair ETHUSDT --once
 
-# Full autonomous mode (runs every 5 minutes)
-python main.py
+# Live trading
+DRY_RUN=false python main.py
 ```
-
-When you're happy with the reasoning quality, set `DRY_RUN=false` in `.env`.
 
 ---
 
-## Key Settings (in .env)
+## Key Settings (.env)
 
 | Setting | Default | Description |
 |---|---|---|
-| `TRADING_PAIRS` | BTCUSDT,ETHUSDT | Pairs to monitor |
-| `CYCLE_INTERVAL_SECONDS` | 300 | How often to run (5 min) |
-| `MIN_CONFIDENCE` | 65 | AI confidence % needed to trade |
-| `MAX_POSITION_PCT` | 20 | Max % of balance per trade (20% of ~$10 = $2) |
-| `STOP_LOSS_PCT` | 2.0 | Stop loss % from entry |
-| `TAKE_PROFIT_PCT` | 4.0 | Take profit % from entry (2:1 R/R) |
-| `DRY_RUN` | true | Set false only when ready for live trading |
-
----
-
-## What the AI Reasons About
-
-Every cycle, Groq receives a full briefing including:
-
-**Technical signals (1H + 4H):**
-- RSI, MACD (cross + histogram), Bollinger Bands position
-- EMA20 vs EMA50 trend, EMA gap %
-- Volume ratio vs 20-period average
-- ATR% (volatility), price change 1h/4h/24h
-- Support & resistance levels
-- Composite technical score (-100 to +100)
-
-**Market context:**
-- Order book bid/ask imbalance
-- Fear & Greed Index (0-100)
-- Latest news headlines with sentiment labels
-- Last 5 predictions + whether they were correct (feedback loop)
-
-**The AI returns:**
-- `direction`: BUY / SELL / HOLD
-- `confidence`: 0-100%
-- `hypothesis`: One sentence explaining its view
-- `signal_alignment`: strong / mixed / contradictory
-- `risk_level`: LOW / MEDIUM / HIGH
-- `reasoning`: Full chain-of-thought
-
----
-
-## Database Tables (Supabase)
-
-### `signal_snapshots`
-Every data collection cycle stored for audit trail.
-
-### `agent_reasoning`
-Every AI analysis — full prompt, hypothesis, confidence, and eventually whether prediction was correct.
-
-### `trade_history`
-Every trade (real or dry-run) with entry, SL, TP, and outcome.
-
-### `prediction_accuracy` view
-```sql
-SELECT * FROM prediction_accuracy;
--- Shows win rate per pair over time
-```
+| `TRADING_PAIRS` | 15 liquid pairs | Pairs to monitor |
+| `CYCLE_INTERVAL_SECONDS` | 30 | How often to scan |
+| `MIN_CONFIDENCE` | 76 | AI confidence % to trade |
+| `FUTURES_LEVERAGE` | 5 | Futures leverage (keep low) |
+| `MAX_POSITION_PCT` | 30 | Max % of balance per trade |
+| `STOP_LOSS_PCT` | 1.5 | Fallback SL % (ATR-based preferred) |
+| `TAKE_PROFIT_PCT` | 3.5 | Fallback TP % (ATR-based preferred) |
+| `MAX_DAILY_LOSS_PCT` | -6.0 | Daily loss circuit breaker |
+| `DRY_RUN` | true | Set false only when ready |
 
 ---
 
 ## Risk Management
 
-With ~$10 USDT:
-- Max position: 20% = ~$2 USDT per trade
-- Position scales with confidence: 65% conf → smaller size, 90% → larger
-- High volatility (ATR > 3%) → position halved automatically
-- No double-positions: only 1 open trade per pair at a time
-- Minimum order: $5.50 USDT (Binance minimum)
-- Contradictory signals → automatic REJECT regardless of confidence
+- **ATR-based SL/TP** — SL = ATR × 1.5, TP = ATR × 3.5 (R:R ≈ 2.3:1). Falls back to fixed % if ATR unavailable.
+- **Funding rate gate** — Rejects LONGs when funding rate is heavily positive (overleveraged longs = squeeze risk). Rejects SHORTs on negative funding.
+- **Liquidity gate** — Rejects pairs with 24h volume < $30M.
+- **Daily loss limit** — Stops trading for the day at `MAX_DAILY_LOSS_PCT`. Telegram alert fires once.
+- **Confidence threshold** — Only trades at ≥ 76% AI confidence.
+- **No double positions** — One open trade per pair at a time.
+- **LONG & SHORT** — Agent can trade both directions on futures.
 
 ---
 
-## Adding More Pairs
+## Telegram Commands
 
-Edit `.env`:
+| Command | Description |
+|---|---|
+| `/status` | Open positions (pulled live from Binance) |
+| `/balance` | Wallet balance (USDT) |
+| `/pause` | Pause trading (current trades stay open) |
+| `/resume` | Resume trading |
+| `/help` | Command list |
+
+Inline buttons on trade alerts: **Close** (market close) — button auto-removes after trade closes.
+
+---
+
+## Browser AI (Gemini / ChatGPT fallback)
+
+When Groq is rate-limited or unavailable, the agent falls back to Gemini or ChatGPT in a real browser via Playwright — no API key needed, uses your logged-in session.
+
+### Setup (one-time)
+
+```bash
+pip install playwright
+playwright install chromium
+
+# Log in to your Google account in the browser
+python agents/browser_ai.py --login gemini
+
+# Or for ChatGPT
+python agents/browser_ai.py --login chatgpt
 ```
-TRADING_PAIRS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT
+
+### Enable in .env
+
+```
+BROWSER_AI_PROVIDER=gemini    # or chatgpt
+BROWSER_AI_HEADED=false       # true to see the browser window
+```
+
+### How it works
+
+- Browser stays open in the background (no per-call startup cost)
+- Each call: paste prompt → send → extract JSON result → reset page for next call
+- 15-second cooldown between calls to avoid rate limiting
+- Prompts > 7000 chars are trimmed (head + tail kept, middle data trimmed)
+- Auto-detects Gemini error pages and retries
+
+### Switch Google account
+
+Delete the session folder and re-login:
+
+```bash
+rm -rf browser_session/
+python agents/browser_ai.py --login gemini
+```
+
+### Test browser AI manually
+
+```bash
+python agents/browser_ai.py --message "Say hello in JSON: {\"hello\": \"world\"}" --headed
 ```
 
 ---
 
-## Logs
+## What the AI Analyses
 
-Logs are written to `logs/agent_YYYY-MM-DD.log` daily.
-Console shows INFO level, file captures DEBUG level for full audit trail.
+**Technical (1H + 4H):**
+RSI, MACD, Bollinger Bands, EMA20/50, ATR, volume ratio, price change, support/resistance, composite score
+
+**Futures market intelligence:**
+- Funding rate — positive = overleveraged longs (SHORT risk), negative = overleveraged shorts (LONG risk)
+- Open interest trend — rising OI confirms move, falling OI = weak conviction
+
+**Market context:**
+Order book imbalance, Fear & Greed Index, news headlines, last 5 predictions + outcomes
+
+**AI returns:**
+`direction` (LONG/SHORT/HOLD), `confidence`, `hypothesis`, `market_regime`, `risk_reward_ratio`, `reasoning`
 
 ---
 
-## Extending the Agent
+## Database Tables
+
+| Table | Contents |
+|---|---|
+| `signal_snapshots` | Every data collection cycle |
+| `agent_reasoning` | Full AI analysis per cycle (prompt, hypothesis, confidence, outcome) |
+| `trade_history` | Every trade with entry, SL, TP, PnL |
+
+```sql
+-- Win rate per pair
+SELECT * FROM prediction_accuracy;
+```
+
+---
+
+## File Structure
+
+```
+main.py                  — Main loop
+config.py                — Env var loading
+constants.py             — ATR multipliers, thresholds
+agents/
+  brain.py               — AI prompt builder + decision logic
+  browser_ai.py          — Playwright browser AI fallback
+  feedback.py            — Outcome tracking
+data/
+  collector.py           — Binance OHLCV, funding rate, open interest, news
+db/
+  client.py              — Supabase client (auto-reconnect)
+  setup.sql              — DB schema
+risk/
+  manager.py             — Risk gates, ATR SL/TP, position sizing
+notifications/
+  telegram.py            — Alerts, commands, trade monitor
+dashboard/
+  index.html             — Local web dashboard
+browser_session/         — Playwright Chrome session (gitignored)
+```
+
+---
+
+## Extending
 
 | Want to add | Where |
 |---|---|
 | New indicator | `data/collector.py` → `compute_indicators()` |
-| New data source | `data/collector.py` → new method + add to `collect_all()` |
+| New data source | `data/collector.py` → new method + `collect_all()` |
 | Change AI model | `config.py` → `GROQ_MODEL` |
 | Change risk rules | `risk/manager.py` → `evaluate()` |
-| Different position sizing | `risk/manager.py` → position size block |
-| Add Telegram alerts | `execution/executor.py` → after trade logged |
+| New Telegram command | `notifications/telegram.py` → `_handle_message()` |
 
 ---
 
-## ⚠️ Important Notes
+## Important Notes
 
-1. **This is experimental software.** Crypto trading involves substantial risk of loss.
-2. **Start with DRY_RUN=true** and watch at least 20-30 cycles before going live.
-3. **With $10 USDT**, many trades will be near Binance's minimum order size. Check `MIN_ORDER_USDT` in `risk/manager.py`.
-4. **Groq free tier** has rate limits. The 5-minute cycle interval is designed to stay within them.
+1. **Experimental software.** Crypto trading involves substantial risk of loss.
+2. **Start with DRY_RUN=true** — watch 20-30 cycles before going live.
+3. **Keep leverage low** — default is 5x. High leverage + tight stops = guaranteed losses.
+4. **Groq free tier** has rate limits. Browser AI fallback handles this automatically.
 5. **Never enable withdrawal permissions** on your Binance API key.

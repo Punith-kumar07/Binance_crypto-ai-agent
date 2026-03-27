@@ -13,9 +13,14 @@ Returns an approved TradeOrder or a REJECT with reason.
 from loguru import logger
 from dataclasses import dataclass, field
 from typing import Optional
+from datetime import datetime, timezone
 import config
+import constants as C
 from db import client as db
 from notifications import telegram as tg
+
+# Tracks "pair-YYYY-MM-DD" keys so the daily limit alert fires only once per pair per day
+_daily_limit_alerted: set = set()
 
 
 @dataclass
@@ -56,7 +61,9 @@ class RiskManager:
         pair        = snapshot["pair"]
         price       = snapshot["current_price"]
         balance     = snapshot["usdt_balance"]
-        atr_pct     = snapshot.get("indicators_1h", {}).get("atr_pct", 1.0)
+        ind1h       = snapshot.get("indicators_1h", {})
+        atr_pct     = ind1h.get("atr_pct", 1.0)
+        atr_val     = ind1h.get("atr", price * 0.01)   # absolute ATR in price units
 
         # ── Gate 1: Daily Loss Limit ────────────────────────────────────────
         daily_pnl = db.get_daily_pnl_pct(pair)
@@ -64,7 +71,36 @@ class RiskManager:
             logger.warning(
                 f"[{pair}] ❌ REJECT: Daily loss limit reached ({daily_pnl:.2f}% <= {config.MAX_DAILY_LOSS_PCT}%)"
             )
-            tg.notify_daily_limit_hit(daily_pnl)
+            alert_key = f"{pair}-{datetime.now(timezone.utc).date().isoformat()}"
+            if alert_key not in _daily_limit_alerted:
+                _daily_limit_alerted.add(alert_key)
+                tg.notify_daily_limit_hit(pair, daily_pnl)
+            return None
+
+        # ── Gate 1b: Funding rate warning — skip if fighting the funding ───
+        funding = snapshot.get("funding_rate", {})
+        fr_warning = funding.get("warning")
+        if fr_warning:
+            if "HIGH_LONG_FUNDING" in fr_warning and direction == "BUY":
+                logger.warning(
+                    f"[{pair}] ❌ REJECT: Funding rate too high ({funding.get('rate_pct',0):+.4f}%) "
+                    f"— risky to go LONG when longs are paying heavily."
+                )
+                return None
+            if "HIGH_SHORT_FUNDING" in fr_warning and direction == "SELL":
+                logger.warning(
+                    f"[{pair}] ❌ REJECT: Funding rate too negative ({funding.get('rate_pct',0):+.4f}%) "
+                    f"— risky to go SHORT when shorts are paying heavily."
+                )
+                return None
+
+        # ── Gate 1c: Liquidity filter — skip low-volume pairs ───────────────
+        quote_vol_24h = snapshot.get("stats_24h", {}).get("quote_volume_24h", 0)
+        if quote_vol_24h and quote_vol_24h < C.MIN_QUOTE_VOLUME_24H:
+            logger.warning(
+                f"[{pair}] ❌ REJECT: 24h volume ${quote_vol_24h:,.0f} below "
+                f"liquidity minimum ${C.MIN_QUOTE_VOLUME_24H:,.0f}"
+            )
             return None
 
         # ── Gate 2: Direction must be actionable ────────────────────────────
@@ -121,13 +157,34 @@ class RiskManager:
         adjusted_size = max(self.MIN_ORDER_USDT, min(adjusted_size, balance * config.MAX_POSITION_PCT))
         adjusted_size = min(adjusted_size, balance - 0.5)  # keep $0.50 buffer for fees
 
-        # ── Compute stop loss + take profit ─────────────────────────────────
+        # ── Compute ATR-based stop loss + take profit ────────────────────────
+        # SL = ATR × 1.5  |  TP = ATR × 3.5  →  R:R ≈ 2.3:1
+        # Falls back to config percentages if ATR is missing/zero.
+        if atr_val and atr_val > 0:
+            sl_distance = atr_val * C.ATR_SL_MULTIPLIER
+            tp_distance = atr_val * C.ATR_TP_MULTIPLIER
+            # Enforce minimum R:R of 2:1
+            if tp_distance < sl_distance * C.ATR_MIN_RR_RATIO:
+                tp_distance = sl_distance * C.ATR_MIN_RR_RATIO
+            sl_pct_actual = sl_distance / price * 100
+            tp_pct_actual = tp_distance / price * 100
+            sl_label = f"ATR×{C.ATR_SL_MULTIPLIER} ({sl_pct_actual:.2f}%)"
+        else:
+            # Fallback to config fixed percentages
+            sl_distance = price * config.STOP_LOSS_PCT
+            tp_distance = price * config.TAKE_PROFIT_PCT
+            sl_pct_actual = config.STOP_LOSS_PCT * 100
+            tp_pct_actual = config.TAKE_PROFIT_PCT * 100
+            sl_label = f"fixed ({sl_pct_actual:.2f}%)"
+
         if direction == "BUY":
-            stop_loss_price    = round(price * (1 - config.STOP_LOSS_PCT), 6)
-            take_profit_price  = round(price * (1 + config.TAKE_PROFIT_PCT), 6)
-        else:  # SELL
-            stop_loss_price    = round(price * (1 + config.STOP_LOSS_PCT), 6)
-            take_profit_price  = round(price * (1 - config.TAKE_PROFIT_PCT), 6)
+            stop_loss_price   = round(price - sl_distance, 6)
+            take_profit_price = round(price + tp_distance, 6)
+        else:  # SELL / SHORT
+            stop_loss_price   = round(price + sl_distance, 6)
+            take_profit_price = round(price - tp_distance, 6)
+
+        rr_actual = round(tp_distance / sl_distance, 2) if sl_distance > 0 else 0
 
         order = TradeOrder(
             pair=pair,
@@ -142,7 +199,8 @@ class RiskManager:
 
         logger.info(
             f"[{pair}] ✅ APPROVED: {direction} ${adjusted_size:.4f} USDT "
-            f"| Entry: {price} | SL: {stop_loss_price} | TP: {take_profit_price} "
+            f"| Entry: {price} | SL: {stop_loss_price} ({sl_label}) "
+            f"| TP: {take_profit_price} ({tp_pct_actual:.2f}%) | R:R={rr_actual} "
             f"| Confidence: {confidence:.0f}% | Alignment: {alignment}"
         )
 

@@ -266,6 +266,80 @@ class DataCollector:
             logger.error(f"Balance fetch failed: {e}")
             return 0.0
 
+    def get_funding_rate(self, pair: str) -> dict:
+        """
+        Fetch current futures funding rate from Binance.
+        Funding rate is paid every 8h between longs and shorts.
+          > +0.01% = longs paying shorts (market overleveraged LONG — risky to go LONG)
+          < -0.01% = shorts paying longs (market overleveraged SHORT — risky to go SHORT)
+        Only meaningful in FUTURES mode. Returns safe defaults for spot.
+        """
+        if config.TRADE_MODE != "futures":
+            return {"rate": 0.0, "bias": "neutral", "warning": None}
+        try:
+            data = self.binance.futures_funding_rate(symbol=pair, limit=1)
+            if not data:
+                return {"rate": 0.0, "bias": "neutral", "warning": None}
+            rate = float(data[0]["fundingRate"])
+            rate_pct = round(rate * 100, 4)
+            annualized = round(rate * 3 * 365 * 100, 2)   # 3 fundings/day × 365
+            bias = (
+                "long_heavy"  if rate > 0.0001 else
+                "short_heavy" if rate < -0.0001 else
+                "neutral"
+            )
+            warning = (
+                "HIGH_LONG_FUNDING — avoid LONG (longs paying heavily)"   if rate > 0.0003 else
+                "HIGH_SHORT_FUNDING — avoid SHORT (shorts paying heavily)" if rate < -0.0003 else
+                None
+            )
+            return {
+                "rate_pct":   rate_pct,
+                "annualized": annualized,
+                "bias":       bias,
+                "warning":    warning,
+            }
+        except Exception as e:
+            logger.debug(f"Funding rate fetch failed for {pair}: {e}")
+        return {"rate_pct": 0.0, "bias": "neutral", "warning": None}
+
+    def get_open_interest(self, pair: str) -> dict:
+        """
+        Fetch current open interest and 1h change from Binance futures.
+        Rising OI + rising price = strong trend (real money entering).
+        Falling OI + falling price = capitulation (potential reversal).
+        Only meaningful in FUTURES mode.
+        """
+        if config.TRADE_MODE != "futures":
+            return {"open_interest": 0, "change_1h_pct": 0, "trend": "unknown"}
+        try:
+            oi_now  = self.binance.futures_open_interest(symbol=pair)
+            oi_hist = self.binance.futures_open_interest_hist(symbol=pair, period="1h", limit=3)
+            current = float(oi_now["openInterest"])
+            change_pct = 0.0
+            if oi_hist and len(oi_hist) >= 2:
+                prev = float(oi_hist[-2]["sumOpenInterest"])
+                change_pct = round((current - prev) / prev * 100, 3) if prev > 0 else 0.0
+            trend = (
+                "increasing" if change_pct > 1 else
+                "decreasing" if change_pct < -1 else
+                "stable"
+            )
+            interpretation = (
+                "new money entering — trend likely to continue" if change_pct > 2 else
+                "money leaving — possible reversal or squeeze"  if change_pct < -2 else
+                "stable positioning"
+            )
+            return {
+                "open_interest":   round(current, 2),
+                "change_1h_pct":   change_pct,
+                "trend":           trend,
+                "interpretation":  interpretation,
+            }
+        except Exception as e:
+            logger.debug(f"Open interest fetch failed for {pair}: {e}")
+        return {"open_interest": 0, "change_1h_pct": 0, "trend": "unknown", "interpretation": "unavailable"}
+
     def get_24h_stats(self, pair: str) -> dict:
         """24h high, low, volume, and price change % from Binance ticker."""
         try:
@@ -624,12 +698,14 @@ class DataCollector:
             raise DataCollectionError(f"[{pair}] 1H indicators empty — not enough candle history")
 
         # Non-critical: failures return safe defaults
-        price     = self.get_current_price(pair)
-        ob_imbal  = self.get_order_book_imbalance(pair)
-        news      = self.get_crypto_news(pair)
-        fng       = self.get_fear_greed_index()
-        balance   = self.get_usdt_balance()
-        stats_24h = self.get_24h_stats(pair)
+        price         = self.get_current_price(pair)
+        ob_imbal      = self.get_order_book_imbalance(pair)
+        news          = self.get_crypto_news(pair)
+        fng           = self.get_fear_greed_index()
+        balance       = self.get_usdt_balance()
+        stats_24h     = self.get_24h_stats(pair)
+        funding_rate  = self.get_funding_rate(pair)
+        open_interest = self.get_open_interest(pair)
 
         # Fall back to last close price if ticker call failed
         if not price:
@@ -648,13 +724,19 @@ class DataCollector:
             "news_summary":         self._news_sentiment_summary(news),
             "fear_greed":           fng,
             "stats_24h":            stats_24h,
+            "funding_rate":         funding_rate,
+            "open_interest":        open_interest,
         }
 
         snapshot = _sanitize(snapshot)
 
+        fr_warn = funding_rate.get("warning")
         logger.info(
             f"[{pair}] Collected | Price={price} | RSI={indicators_1h.get('rsi')} "
             f"| Regime={indicators_1h.get('market_regime')} | FnG={fng.get('value')} "
+            f"| Funding={funding_rate.get('rate_pct',0):+.4f}% ({funding_rate.get('bias','?')}) "
+            f"| OI={open_interest.get('trend','?')} ({open_interest.get('change_1h_pct',0):+.2f}%) "
             f"| News={len(news)} ({snapshot['news_summary'].get('bias')})"
+            + (f" ⚠️  {fr_warn}" if fr_warn else "")
         )
         return snapshot

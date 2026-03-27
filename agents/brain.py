@@ -713,6 +713,13 @@ Trade context: {mode_line}
 ▶ ORDER BOOK IMBALANCE: {ob:+.3f}
   (>+0.2 = strong buy pressure | <-0.2 = strong sell pressure)
 
+▶ FUTURES MARKET INTELLIGENCE:
+  Funding Rate: {snapshot.get('funding_rate',{}).get('rate_pct',0):+.4f}% per 8h | Bias: {snapshot.get('funding_rate',{}).get('bias','neutral')} | Annualized: {snapshot.get('funding_rate',{}).get('annualized',0):+.1f}%
+  {f"⚠️  WARNING: {snapshot.get('funding_rate',{}).get('warning')}" if snapshot.get('funding_rate',{}).get('warning') else "Funding: within normal range"}
+  Open Interest: {snapshot.get('open_interest',{}).get('change_1h_pct',0):+.2f}% (1h) | Trend: {snapshot.get('open_interest',{}).get('trend','unknown')}
+  → {snapshot.get('open_interest',{}).get('interpretation','unavailable')}
+  (Rising OI + rising price = strong trend. Falling OI = capitulation/reversal risk.)
+
 ▶ MARKET SENTIMENT — Fear & Greed: {fng.get('value',50)}/100 ({fng.get('label','?')})
   Daily trend: {fng.get('trend','?')} | Weekly trend: {fng.get('weekly_trend','?')}
   → {fng.get('interpretation','')}
@@ -744,22 +751,33 @@ STEP 4 — NEWS CATALYST ASSESSMENT:
   High-impact bearish news = short opportunity. High-impact bullish news = long opportunity.
   No news = technically driven move = more predictable short-term.
 
-STEP 5 — HYPOTHESIS & TRADE HORIZON:
-  Form ONE clear hypothesis for the next 10-40 MINUTES.
-  This is a short-term futures trade with automatic TP/SL exits.
-  Estimate how many minutes you expect before price hits TP or SL.
-  Only trade if R:R > 1.5:1 and you have conviction.
+STEP 5 — FUNDING RATE & OPEN INTEREST CHECK:
+  Funding rate > +0.03% = market overleveraged LONG → HIGH risk to go LONG (squeeze likely).
+  Funding rate < -0.03% = market overleveraged SHORT → HIGH risk to go SHORT (squeeze likely).
+  Trade WITH the funding rate when possible (e.g. SHORT when funding is very positive = get paid).
+  Rising OI + price moving in your direction = conviction signal (real money confirming move).
+  Falling OI + price moving = weak move, likely to reverse. Reduce confidence.
 
-STEP 6 — CONFIDENCE CALIBRATION:
+STEP 6 — HYPOTHESIS & TRADE HORIZON:
+  Form ONE clear hypothesis for the next 10-40 MINUTES.
+  This is a short-term futures trade with automatic TP/SL exits (SL=ATR×1.5, TP=ATR×3.5).
+  Estimate how many minutes you expect before price hits TP or SL.
+  Only trade if R:R > 2.0:1 and you have strong conviction. HOLD if no clear edge.
+
+STEP 7 — CONFIDENCE CALIBRATION:
   Start at 50%. Adjust:
   +15 if 1H and 4H fully agree on direction (both bullish = BUY, both bearish = SELL)
-  +10 if volume confirms (OBV matches + volume spike)
+  +10 if volume + OBV confirms direction
   +10 if strong news catalyst aligns with direction
   +10 if market regime matches strategy (trending→follow trend, ranging→fade extremes)
+  +10 if funding rate supports direction (e.g. SHORT with positive funding = get paid)
+  +5  if open interest rising in direction of trade (real money entering)
   -15 if timeframes contradict
-  -10 if high ATR% (>2%) = unpredictable short-term swings
+  -10 if funding rate strongly against direction (risky squeeze setup)
+  -10 if high ATR% (>2%) with no clear momentum = unpredictable short-term swings
   -10 if signals are mixed with no dominant direction
-  Final confidence must reflect genuine conviction. Bearish markets deserve SELL — do not force BUY.
+  -5  if open interest falling (weak, uncommitted move)
+  Final confidence must reflect genuine conviction. Never trade without a clear edge.
 
 Respond ONLY with a JSON object (no markdown, no text outside JSON):
 {{
